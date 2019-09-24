@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"runtime"
@@ -142,6 +143,89 @@ func NewTxn(wal *os.File) *Txn {
 		db:       make(map[string]Record),
 		writeSet: make(map[string]RecordCache),
 	}
+}
+
+func (txn *Txn) Load() error {
+	if _, err := txn.wal.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+
+	var (
+		logs []RecordLog
+		buf  [4096]byte
+		size int
+	)
+
+	// redo all record logs in WAL file
+	for {
+		n, err := txn.wal.Read(buf[size:])
+		size += n
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			return err
+		}
+
+		head := 0
+		for {
+			var rlog RecordLog
+			n, err = rlog.Deserialize(buf[head:size])
+			if err == ErrBufferShort {
+				// move data to head
+				copy(buf[:], buf[head:size])
+				size -= head
+
+				if size == 4096 {
+					// buffer size (4096) is too short for this log
+					// TODO: allocate and read directly to db buffer
+					return err
+				}
+				// read more log data to buffer
+				break
+			} else if err != nil {
+				return err
+			}
+			head += n
+
+			switch rlog.Action {
+			case LInsert, LUpdate, LDelete:
+				// append log
+				logs = append(logs, rlog)
+
+			case LCommit:
+				// redo record logs
+				for _, rlog := range logs {
+					switch rlog.Action {
+					case LInsert:
+						txn.db[rlog.Key] = rlog.Record
+
+					case LUpdate:
+						// reuse Key string in db and Key in rlog will be GCed.
+						r, ok := txn.db[rlog.Key]
+						if !ok {
+							// record in db may be sometimes deleted. complete with rlog.Key for idempotency.
+							r.Key = rlog.Key
+						}
+						r.Value = rlog.Value
+						txn.db[r.Key] = r
+
+					case LDelete:
+						delete(txn.db, rlog.Key)
+					}
+				}
+				// clear logs
+				logs = nil
+
+			case LAbort:
+				// clear logs
+				logs = nil
+
+			default:
+				// skip
+			}
+		}
+	}
+	return nil
 }
 
 func (txn *Txn) Read(key string) ([]byte, error) {
