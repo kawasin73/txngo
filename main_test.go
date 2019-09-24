@@ -415,8 +415,10 @@ func TestTxn_LoadWAL(t *testing.T) {
 	t.Run("empty WAL", func(t *testing.T) {
 		txn := createTestTxn(t)
 		defer txn.wal.Close()
-		if err := txn.LoadWAL(); err != nil {
+		if n, err := txn.LoadWAL(); err != nil {
 			t.Errorf("failed to load : %v", err)
+		} else if n != 0 {
+			t.Errorf("load wal %v logs, expected 0", n)
 		}
 	})
 
@@ -442,8 +444,10 @@ func TestTxn_LoadWAL(t *testing.T) {
 		// write log to WAL file
 		writeLogs(t, txn.wal, logs)
 
-		if err := txn.LoadWAL(); err != nil {
+		if n, err := txn.LoadWAL(); err != nil {
 			t.Errorf("failed to load : %v", err)
+		} else if n != len(logs) {
+			t.Errorf("load wal %v logs, expected %v", n, len(logs))
 		}
 		assertValue(t, txn, "key1", []byte("value8"))
 		assertNotExist(t, txn, "key2")
@@ -453,8 +457,10 @@ func TestTxn_LoadWAL(t *testing.T) {
 		// check idenpotency
 		clearFile(t, txn.wal)
 		writeLogs(t, txn.wal, logs)
-		if err := txn.LoadWAL(); err != nil {
+		if n, err := txn.LoadWAL(); err != nil {
 			t.Errorf("failed to load : %v", err)
+		} else if n != len(logs) {
+			t.Errorf("load wal %v logs, expected %v", n, len(logs))
 		}
 		assertValue(t, txn, "key1", []byte("value8"))
 		assertNotExist(t, txn, "key2")
@@ -483,8 +489,10 @@ func TestTxn_LoadWAL(t *testing.T) {
 		// write log to WAL file
 		writeLogs(t, txn.wal, logs)
 
-		if err := txn.LoadWAL(); err != nil {
+		if n, err := txn.LoadWAL(); err != nil {
 			t.Errorf("failed to load : %v", err)
+		} else if n != len(logs) {
+			t.Errorf("load wal %v logs, expected %v", n, len(logs))
 		}
 		assertValue(t, txn, "key1", []byte("value1"))
 		assertValue(t, txn, "key2", []byte("value5"))
@@ -494,8 +502,10 @@ func TestTxn_LoadWAL(t *testing.T) {
 		// check idenpotency
 		clearFile(t, txn.wal)
 		writeLogs(t, txn.wal, logs)
-		if err := txn.LoadWAL(); err != nil {
+		if n, err := txn.LoadWAL(); err != nil {
 			t.Errorf("failed to load : %v", err)
+		} else if n != len(logs) {
+			t.Errorf("load wal %v logs, expected %v", n, len(logs))
 		}
 		assertValue(t, txn, "key1", []byte("value1"))
 		assertValue(t, txn, "key2", []byte("value5"))

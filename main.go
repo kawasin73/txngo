@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"encoding/binary"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"runtime"
+	"strings"
 )
 
 const (
@@ -143,15 +146,16 @@ func NewTxn(wal *os.File, dbPath, tmpPath string) *Txn {
 	}
 }
 
-func (txn *Txn) LoadWAL() error {
+func (txn *Txn) LoadWAL() (int, error) {
 	if _, err := txn.wal.Seek(0, io.SeekStart); err != nil {
-		return err
+		return 0, err
 	}
 
 	var (
-		logs []RecordLog
-		buf  [4096]byte
-		size int
+		logs  []RecordLog
+		buf   [4096]byte
+		size  int
+		nlogs int
 	)
 
 	// redo all record logs in WAL file
@@ -161,7 +165,7 @@ func (txn *Txn) LoadWAL() error {
 		if err == io.EOF {
 			break
 		} else if err != nil {
-			return err
+			return 0, err
 		}
 
 		head := 0
@@ -176,14 +180,15 @@ func (txn *Txn) LoadWAL() error {
 				if size == 4096 {
 					// buffer size (4096) is too short for this log
 					// TODO: allocate and read directly to db buffer
-					return err
+					return 0, err
 				}
 				// read more log data to buffer
 				break
 			} else if err != nil {
-				return err
+				return 0, err
 			}
 			head += n
+			nlogs++
 
 			switch rlog.Action {
 			case LInsert, LUpdate, LDelete:
@@ -223,7 +228,7 @@ func (txn *Txn) LoadWAL() error {
 			}
 		}
 	}
-	return nil
+	return nlogs, nil
 }
 
 func (txn *Txn) ClearWAL() error {
@@ -333,7 +338,7 @@ func (txn *Txn) LoadCheckPoint() error {
 			var r Record
 			n, err = r.Deserialize(buf[head:size])
 			if err == ErrBufferShort {
-				if size - head == 4096 {
+				if size-head == 4096 {
 					// buffer size (4096) is too short for this log
 					// TODO: allocate and read directly to db buffer
 					return err
@@ -568,49 +573,146 @@ func (txn *Txn) Abort() {
 }
 
 func main() {
-	const (
-		walPath = "./txngo.log"
-		dbPath  = "./txngo.db"
-		tmpPath = "./txngo.tmp"
-	)
+	walPath := flag.String("wal", "./txngo.log", "file path of WAL file")
+	dbPath := flag.String("db", "./txngo.db", "file path of data file")
+	isInit := flag.Bool("init", true, "create data file if not exist")
+
+	flag.Parse()
 
 	// execute on single thread
 	runtime.GOMAXPROCS(1)
 
-	wal, err := os.OpenFile(walPath, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0600)
+	wal, err := os.OpenFile(*walPath, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0600)
 	if err != nil {
 		log.Panic(err)
 	}
-	//file, err := os.OpenFile(dbPath, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0600)
-	//if err != nil {
-	//	log.Panic(err)
-	//}
+	defer wal.Close()
 
-	txn := NewTxn(wal, dbPath, tmpPath)
+	txn := NewTxn(wal, *dbPath, *dbPath+".tmp")
 
-	err = txn.Insert("key1", []byte("value1"))
-	log.Println("insert key1", err)
+	log.Println("loading data file...")
+	if err = txn.LoadCheckPoint(); os.IsNotExist(err) && *isInit {
+		log.Println("db file is not found. this is initial start.")
+	} else if err != nil {
+		log.Printf("failed to load data file : %v\n", err)
+		return
+	}
 
-	v, err := txn.Read("key1")
-	log.Println("read key1", v, err)
+	log.Println("loading WAL file...")
+	if nlogs, err := txn.LoadWAL(); err != nil {
+		log.Printf("failed to load WAL file : %v\n", err)
+		return
+	} else if nlogs != 0 {
+		log.Println("previous shutdown is not success...")
+		log.Println("update data file...")
+		if err = txn.SaveCheckPoint(); err != nil {
+			log.Printf("failed to save checkpoint %v\n", err)
+			return
+		}
+		log.Println("clear WAL file...")
+		if err = txn.ClearWAL(); err != nil {
+			log.Printf("failed to clear WAL file %v\n", err)
+			return
+		}
+	}
 
-	v, err = txn.Read("key2")
-	log.Println("read key2", v, err)
+	defer func() {
+		log.Println("shutdown...")
 
-	err = txn.Insert("key3", []byte("value3"))
-	log.Println("insert key3", err)
+		if err = txn.SaveCheckPoint(); err != nil {
+			log.Printf("failed to save data file : %v\n", err)
+		} else if err = txn.ClearWAL(); err != nil {
+			log.Printf("failed to clear WAL file : %v\n", err)
+		} else {
+			log.Println("success to save data")
+		}
+	}()
 
-	err = txn.Commit()
-	log.Println("commit", err)
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		fmt.Printf(">> ")
+		txt, err := reader.ReadString('\n')
+		if err != nil {
+			fmt.Printf("failed to read command : %v", err)
+			break
+		}
 
-	err = txn.Insert("key1", []byte("value1"))
-	log.Println("insert key1", err)
+		txt = strings.TrimSpace(txt)
+		cmd := strings.Split(txt, " ")
+		if len(cmd) == 0 || len(cmd[0]) == 0 {
+			continue
+		}
+		switch strings.ToLower(cmd[0]) {
+		case "insert":
+			if len(cmd) != 3 {
+				fmt.Println("invalid command : insert <key> <value>")
+			} else if err = txn.Insert(cmd[1], []byte(cmd[2])); err != nil {
+				fmt.Printf("failed to insert : %v\n", err)
+			} else {
+				fmt.Printf("success to insert %q\n", cmd[1])
+			}
 
-	v, err = txn.Read("key1")
-	log.Println("read key1", v, err)
+		case "update":
+			if len(cmd) != 3 {
+				fmt.Println("invalid command : update <key> <value>")
+			} else if err = txn.Update(cmd[1], []byte(cmd[2])); err != nil {
+				fmt.Printf("failed to update : %v\n", err)
+			} else {
+				fmt.Printf("success to update %q\n", cmd[1])
+			}
 
-	v, err = txn.Read("key3")
-	log.Println("read key3", v, err)
+		case "delete":
+			if len(cmd) != 2 {
+				fmt.Println("invalid command : delete <key>")
+			} else if err = txn.Delete(cmd[1]); err != nil {
+				fmt.Printf("failed to delete : %v\n", err)
+			} else {
+				fmt.Printf("success to delete %q\n", cmd[1])
+			}
 
-	log.Println("writeset", len(txn.writeSet), "db", len(txn.db))
+		case "read":
+			if len(cmd) != 2 {
+				fmt.Println("invalid command : read <key>")
+			} else if v, err := txn.Read(cmd[1]); err != nil {
+				fmt.Printf("failed to read : %v\n", err)
+			} else {
+				fmt.Printf("%v\n", string(v))
+			}
+
+		case "commit":
+			if len(cmd) != 1 {
+				fmt.Println("invalid command : commit")
+			} else if err = txn.Commit(); err != nil {
+				fmt.Printf("failed to commit : %v\n", err)
+			} else {
+				fmt.Println("committed")
+			}
+
+		case "abort":
+			if len(cmd) != 1 {
+				fmt.Println("invalid command : abort")
+			} else {
+				txn.Abort()
+				fmt.Println("aborted")
+			}
+
+		case "keys":
+			if len(cmd) != 1 {
+				fmt.Println("invalid command : keys")
+			} else {
+				fmt.Println(">>> show keys commited <<<")
+				for k, _ := range txn.db {
+					fmt.Println(k)
+				}
+			}
+
+		case "quit", "exit", "q":
+			fmt.Println("byebye")
+			return
+
+		default:
+			fmt.Println("invalid command : not supported")
+		}
+	}
+
 }
