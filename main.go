@@ -169,8 +169,10 @@ func (txn *Txn) Insert(key string, value []byte) error {
 			return ErrExist
 		}
 		// Delete -> Insert == Update
+		// FIXME: Insert -> Delete -> Insert must be Insert (it is invalid)
 		r.Action = LUpdate
 		r.Value = clone(value)
+		txn.writeSet[r.Key] = r
 		return nil
 	}
 
@@ -190,6 +192,63 @@ func (txn *Txn) Insert(key string, value []byte) error {
 		Record: Record{
 			Key:   key,
 			Value: value,
+		},
+	}
+	return nil
+}
+
+func (txn *Txn) Update(key string, value []byte) error {
+	// check writeSet
+	if r, ok := txn.writeSet[key]; ok {
+		if r.Action == LDelete {
+			return ErrNotExist
+		}
+		r.Value = clone(value)
+		txn.writeSet[r.Key] = r
+		return nil
+	}
+
+	r, ok := txn.db[key]
+	if !ok {
+		return ErrNotExist
+	}
+
+	txn.writeSet[r.Key] = RecordLog{
+		Action: LUpdate,
+		Record: Record{
+			Key: r.Key,
+			// clone value to prevent injection after transaction
+			Value: clone(value),
+		},
+	}
+	return nil
+}
+
+func (txn *Txn) Delete(key string) error {
+	// check writeSet
+	if r, ok := txn.writeSet[key]; ok {
+		if r.Action == LDelete {
+			return ErrNotExist
+		} else if r.Action == LInsert {
+			delete(txn.writeSet, key)
+			return nil
+		}
+		r.Value = nil
+		// FIXME: Insert -> Delete will be only Delete (it is invalid)
+		r.Action = LDelete
+		txn.writeSet[r.Key] = r
+		return nil
+	}
+
+	r, ok := txn.db[key]
+	if !ok {
+		return ErrNotExist
+	}
+
+	txn.writeSet[r.Key] = RecordLog{
+		Action: LDelete,
+		Record: Record{
+			Key: r.Key,
 		},
 	}
 	return nil
@@ -261,6 +320,12 @@ func (txn *Txn) Commit() error {
 	}
 
 	return nil
+}
+
+func (txn *Txn) Abort() {
+	for k := range txn.writeSet {
+		delete(txn.writeSet, k)
+	}
 }
 
 func main() {
