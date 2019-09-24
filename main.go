@@ -11,12 +11,6 @@ import (
 )
 
 const (
-	walPath = "./txngo.log"
-	dbPath  = "./txngo.db"
-	tmpPath = "./txngo.tmp"
-)
-
-const (
 	LInsert = 1 + iota
 	LDelete
 	LUpdate
@@ -131,21 +125,25 @@ type RecordCache struct {
 }
 
 type Txn struct {
+	dbPath   string
+	tmpPath  string
 	wal      *os.File
 	db       map[string]Record
 	logs     []RecordLog
 	writeSet map[string]RecordCache
 }
 
-func NewTxn(wal *os.File) *Txn {
+func NewTxn(wal *os.File, dbPath, tmpPath string) *Txn {
 	return &Txn{
+		dbPath:   dbPath,
+		tmpPath:  tmpPath,
 		wal:      wal,
 		db:       make(map[string]Record),
 		writeSet: make(map[string]RecordCache),
 	}
 }
 
-func (txn *Txn) Load() error {
+func (txn *Txn) LoadWAL() error {
 	if _, err := txn.wal.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
@@ -224,6 +222,142 @@ func (txn *Txn) Load() error {
 				// skip
 			}
 		}
+	}
+	return nil
+}
+
+func (txn *Txn) ClearWAL() error {
+	if _, err := txn.wal.Seek(0, io.SeekStart); err != nil {
+		return err
+	} else if err = txn.wal.Truncate(0); err != nil {
+		return err
+		// it is not obvious that ftruncate(2) sync the change to disk or not. sync explicitly for safe.
+	} else if err = txn.wal.Sync(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (txn *Txn) SaveCheckPoint() error {
+	// create temporary checkout file
+	f, err := os.Create(txn.tmpPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	var buf [4096]byte
+	// write header
+	binary.BigEndian.PutUint32(buf[:4], uint32(len(txn.db)))
+	_, err = f.Write(buf[:4])
+	if err != nil {
+		return err
+	}
+
+	// write all data
+	for _, r := range txn.db {
+		// FIXME: key order in map will be randomized
+		n, err := r.Serialize(buf[:])
+		if err == ErrBufferShort {
+			// TODO: use writev
+			return err
+		} else if err != nil {
+			return err
+		}
+
+		// TODO: delay write and combine multi log into one buffer
+		_, err = f.Write(buf[:n])
+		if err != nil {
+			return err
+		}
+	}
+
+	// swap dbfile and temporary file
+	err = os.Rename(txn.tmpPath, txn.dbPath)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (txn *Txn) LoadCheckPoint() error {
+	f, err := os.Open(txn.dbPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	var (
+		buf    [4096]byte
+		size   int
+		loaded uint32
+		total  uint32
+	)
+
+	// read all data
+	for {
+		n, err := f.Read(buf[size:])
+		size += n
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			return err
+		}
+
+		head := 0
+		if total == 0 {
+			// parse header
+			if size < 4 {
+				return fmt.Errorf("file header size is too short : %v", size)
+			}
+			total = binary.BigEndian.Uint32(buf[:4])
+			if total == 0 {
+				if size == 4 {
+					return nil
+				} else {
+					return fmt.Errorf("total is 0. but db file have some data")
+				}
+			}
+			head += 4
+		} else if loaded == total {
+			break
+		}
+
+		for {
+			if loaded == total {
+				// loaded all records
+				// try read file again to check no more data in file (if there is, file is invalid)
+				break
+			}
+			var r Record
+			n, err = r.Deserialize(buf[head:size])
+			if err == ErrBufferShort {
+				if size - head == 4096 {
+					// buffer size (4096) is too short for this log
+					// TODO: allocate and read directly to db buffer
+					return err
+				}
+				// read more log data to buffer
+				break
+			} else if err != nil {
+				return err
+			}
+			head += n
+
+			// set data
+			txn.db[r.Key] = r
+			loaded++
+		}
+		// move data to head
+		copy(buf[:], buf[head:size])
+		size -= head
+	}
+
+	if loaded != total {
+		return fmt.Errorf("db file is broken : total %v records but actually %v records", total, loaded)
+	} else if size != 0 {
+		return fmt.Errorf("db file is broken : file size is larger than expected")
 	}
 	return nil
 }
@@ -379,6 +513,8 @@ func (txn *Txn) Commit() error {
 		if err == ErrBufferShort {
 			// TODO: use writev
 			return err
+		} else if err != nil {
+			return err
 		}
 
 		// TODO: delay write and combine multi log into one buffer
@@ -432,6 +568,12 @@ func (txn *Txn) Abort() {
 }
 
 func main() {
+	const (
+		walPath = "./txngo.log"
+		dbPath  = "./txngo.db"
+		tmpPath = "./txngo.tmp"
+	)
+
 	// execute on single thread
 	runtime.GOMAXPROCS(1)
 
@@ -444,7 +586,7 @@ func main() {
 	//	log.Panic(err)
 	//}
 
-	txn := NewTxn(wal)
+	txn := NewTxn(wal, dbPath, tmpPath)
 
 	err = txn.Insert("key1", []byte("value1"))
 	log.Println("insert key1", err)
