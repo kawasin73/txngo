@@ -1,5 +1,7 @@
 # txngo
 
+[![Build Status](https://github.com/kawasin73/txngo/workflows/Go/badge.svg)](https://github.com/kawasin73/txngo/actions)
+
 simple transaction implementation with Go.
 
 txngo is now based on **Trivial Scheduler** (Single Thread + No Concurrency) and is **In-memory KVS**.
