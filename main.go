@@ -281,10 +281,10 @@ func (txn *Txn) Delete(key string) error {
 }
 
 func (txn *Txn) Commit() error {
-	if len(txn.writeSet) == 0 {
-		// no need to write WAL
-		return nil
-	}
+	//if len(txn.writeSet) == 0 {
+	//	// no need to write WAL
+	//	return nil
+	//}
 	var (
 		i   int
 		buf [4096]byte

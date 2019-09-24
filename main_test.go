@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"io/ioutil"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -284,4 +286,72 @@ func TestTxn_Abort(t *testing.T) {
 			t.Errorf("value1 is not match %v : %v", v, value1)
 		}
 	})
+}
+
+func TestWAL(t *testing.T) {
+	txn := createTestTxn(t)
+	defer txn.wal.Close()
+	logs := []RecordLog{
+		{Action: LCommit},
+		{Action: LInsert, Record: Record{Key: "key1", Value: []byte("value1")}},
+		{Action: LInsert, Record: Record{Key: "key2", Value: []byte("value2")}},
+		{Action: LInsert, Record: Record{Key: "key3", Value: []byte("value3")}},
+		{Action: LInsert, Record: Record{Key: "key4", Value: []byte("value4")}},
+		{Action: LUpdate, Record: Record{Key: "key2", Value: []byte("value5")}},
+		{Action: LDelete, Record: Record{Key: "key3", Value: []byte("")}}, // TODO: delete log not need to have value
+		{Action: LUpdate, Record: Record{Key: "key4", Value: []byte("value6")}},
+		{Action: LUpdate, Record: Record{Key: "key4", Value: []byte("value7")}},
+		{Action: LCommit},
+		{Action: LUpdate, Record: Record{Key: "key1", Value: []byte("value8")}},
+		{Action: LDelete, Record: Record{Key: "key2", Value: []byte("")}}, // TODO: delete log not need to have value
+		{Action: LInsert, Record: Record{Key: "key3", Value: []byte("value8")}},
+		{Action: LCommit},
+	}
+	for _, rlog := range logs {
+		switch rlog.Action {
+		case LInsert:
+			if err := txn.Insert(rlog.Key, rlog.Value); err != nil {
+				t.Errorf("failed to insert %v : %v", rlog, err)
+			}
+
+		case LUpdate:
+			if err := txn.Update(rlog.Key, rlog.Value); err != nil {
+				t.Errorf("failed to update %v : %v", rlog, err)
+			}
+
+		case LDelete:
+			if err := txn.Delete(rlog.Key); err != nil {
+				t.Errorf("failed to delete %v : %v", rlog, err)
+			}
+
+		case LCommit:
+			if err := txn.Commit(); err != nil {
+				t.Errorf("failed to commit %v : %v", rlog, err)
+			}
+
+		default:
+			t.Fatalf("unexpected log %v", rlog)
+		}
+	}
+
+	buf, err := ioutil.ReadFile(txn.wal.Name())
+	if err != nil {
+		t.Errorf("failed to read WAL file : %v", err)
+	}
+	logsInFile := make([]RecordLog, len(logs))
+	for i := 0; i < len(logs); i++ {
+		n, err := logsInFile[i].Deserialize(buf)
+		if err != nil {
+			t.Fatalf("failed to deserialize log : n == %v : %v : buffer = %v", i, err, buf)
+		}
+		buf = buf[n:]
+	}
+	if len(buf) != 0 {
+		t.Fatalf("log file is bigger than expected : %v", buf)
+	}
+	for i := 0; i < len(logs); i++ {
+		if !reflect.DeepEqual(logsInFile[i], logs[i]) {
+			t.Errorf("log not match : index == %v, %v, %v", i, logsInFile[i], logs[i])
+		}
+	}
 }
