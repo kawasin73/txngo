@@ -256,7 +256,7 @@ func (txn *Txn) SaveCheckPoint() error {
 	binary.BigEndian.PutUint32(buf[:4], uint32(len(txn.db)))
 	_, err = f.Write(buf[:4])
 	if err != nil {
-		return err
+		goto ERROR
 	}
 
 	// write all data
@@ -265,25 +265,35 @@ func (txn *Txn) SaveCheckPoint() error {
 		n, err := r.Serialize(buf[:])
 		if err == ErrBufferShort {
 			// TODO: use writev
-			return err
+			goto ERROR
 		} else if err != nil {
-			return err
+			goto ERROR
 		}
 
 		// TODO: delay write and combine multi log into one buffer
 		_, err = f.Write(buf[:n])
 		if err != nil {
-			return err
+			goto ERROR
 		}
+	}
+
+	if err = f.Sync(); err != nil {
+		goto ERROR
 	}
 
 	// swap dbfile and temporary file
 	err = os.Rename(txn.tmpPath, txn.dbPath)
 	if err != nil {
-		return err
+		goto ERROR
 	}
 
 	return nil
+
+ERROR:
+	if rerr := os.Remove(txn.tmpPath); rerr != nil {
+		log.Println("failed to remove temporary file for checkpoint :", rerr)
+	}
+	return err
 }
 
 func (txn *Txn) LoadCheckPoint() error {
