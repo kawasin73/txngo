@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"log"
 	"os"
@@ -26,6 +27,7 @@ var (
 	ErrExist       = errors.New("record already exists")
 	ErrNotExist    = errors.New("record not exists")
 	ErrBufferShort = errors.New("buffer size is not enough to deserialize")
+	ErrChecksum    = errors.New("checksum does not match")
 )
 
 type Record struct {
@@ -36,7 +38,8 @@ type Record struct {
 func (r *Record) Serialize(buf []byte) (int, error) {
 	key := []byte(r.Key)
 	value := r.Value
-	total := 5 + len(key) + len(value)
+	recordLen := 5 + len(key) + len(value)
+	total := recordLen + 4
 
 	// check buffer size
 	if len(buf) < total {
@@ -49,6 +52,14 @@ func (r *Record) Serialize(buf []byte) (int, error) {
 	binary.BigEndian.PutUint32(buf[1:], uint32(len(r.Value)))
 	copy(buf[5:], key)
 	copy(buf[5+len(key):], r.Value)
+
+	// generate checksum
+	hash := crc32.NewIEEE()
+	if _, err := hash.Write(buf[:recordLen]); err != nil {
+		return 0, err
+	}
+	binary.BigEndian.PutUint32(buf[recordLen:], hash.Sum32())
+
 	return total, nil
 }
 
@@ -60,16 +71,26 @@ func (r *Record) Deserialize(buf []byte) (int, error) {
 	// parse length
 	keyLen := buf[0]
 	valueLen := binary.BigEndian.Uint32(buf[1:])
-	total := 5 + int(keyLen) + int(valueLen)
+	recordLen := 5 + int(keyLen) + int(valueLen)
+	total := recordLen + 4
 	if len(buf) < total {
 		return 0, ErrBufferShort
+	}
+
+	// validate checksum
+	hash := crc32.NewIEEE()
+	if _, err := hash.Write(buf[:recordLen]); err != nil {
+		return 0, err
+	}
+	if binary.BigEndian.Uint32(buf[recordLen:]) != hash.Sum32() {
+		return 0, ErrChecksum
 	}
 
 	// copy key and value from buffer
 	r.Key = string(buf[5 : 5+keyLen])
 	// TODO: support NULL value
 	r.Value = make([]byte, valueLen)
-	copy(r.Value, buf[5+keyLen:total])
+	copy(r.Value, buf[5+keyLen:recordLen])
 
 	return total, nil
 }
