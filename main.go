@@ -445,70 +445,66 @@ func (s *Storage) LoadCheckPoint() error {
 	}
 	defer f.Close()
 
+	var buf [4096]byte
+
+	// read and parse header
+	n, err := f.Read(buf[:])
+	if err != nil {
+		return err
+	} else if n < 4 {
+		return fmt.Errorf("file header size is too short : %v", n)
+	}
+	total := binary.BigEndian.Uint32(buf[:4])
+	if total == 0 {
+		if n == 4 {
+			return nil
+		} else {
+			return fmt.Errorf("total is 0. but db file have some data")
+		}
+	}
+
 	var (
-		buf    [4096]byte
-		size   int
+		head   = 4
+		size   = n
 		loaded uint32
-		total  uint32
 	)
 
 	// read all data
 	for {
-		n, err := f.Read(buf[size:])
-		size += n
-		if err == io.EOF {
-			break
-		} else if err != nil {
-			return err
-		}
+		var r Record
+		n, err = r.Deserialize(buf[head:size])
+		if err == ErrBufferShort {
+			if size-head == 4096 {
+				// buffer size (4096) is too short for this log
+				// TODO: allocate and read directly to db buffer
+				return err
+			}
 
-		head := 0
-		if total == 0 {
-			// parse header
-			if size < 4 {
-				return fmt.Errorf("file header size is too short : %v", size)
-			}
-			total = binary.BigEndian.Uint32(buf[:4])
-			if total == 0 {
-				if size == 4 {
-					return nil
-				} else {
-					return fmt.Errorf("total is 0. but db file have some data")
-				}
-			}
-			head += 4
-		} else if loaded == total {
-			break
-		}
+			// move data to head
+			copy(buf[:], buf[head:size])
+			size -= head
 
-		for {
-			if loaded == total {
-				// loaded all records
-				// try read file again to check no more data in file (if there is, file is invalid)
-				break
-			}
-			var r Record
-			n, err = r.Deserialize(buf[head:size])
-			if err == ErrBufferShort {
-				if size-head == 4096 {
-					// buffer size (4096) is too short for this log
-					// TODO: allocate and read directly to db buffer
-					return err
-				}
-				// read more log data to buffer
+			// read more log data to buffer
+			n, err = f.Read(buf[size:])
+			size += n
+			if err == io.EOF {
 				break
 			} else if err != nil {
 				return err
 			}
-			head += n
-
-			// set data
-			s.db[r.Key] = r
-			loaded++
+		} else if err != nil {
+			return err
 		}
-		// move data to head
-		copy(buf[:], buf[head:size])
-		size -= head
+
+		// set data
+		s.db[r.Key] = r
+		loaded++
+		head += n
+
+		if loaded > total {
+			// records in checkpoint file is more than specified in header
+			break
+		}
 	}
 
 	if loaded != total {
