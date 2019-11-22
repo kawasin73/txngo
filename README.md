@@ -4,7 +4,7 @@
 
 simple transaction implementation with Go.
 
-txngo is now based on **Trivial Scheduler** (Single Thread + No Concurrency) and is **In-memory KVS**.
+txngo is now based on **S2PL (Strict Two Phase Lock) Concurrency Control** with Single Thread and is **In-memory KVS**.
 
 Key is string (< 255 length) and Value is []byte (< unsigned 32bit interger max size). 
 
@@ -17,7 +17,7 @@ Key is string (< 255 length) and Value is []byte (< unsigned 32bit interger max 
   - write back data only when shutdown
 - Crash Recovery
   - Redo log have idempotency.
-- Interactive Interface using stdin and stdout
+- Interactive Interface using stdin and stdout or tcp connection
 
 ## Example
 
@@ -90,6 +90,8 @@ Usage of ./txngo:
     	file path of data file (default "./txngo.db")
   -init
     	create data file if not exist (default true)
+  -tcp string
+    	tcp handler address (e.g. localhost:3000)
   -wal string
     	file path of WAL file (default "./txngo.log")
 ```
