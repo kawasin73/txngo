@@ -20,14 +20,14 @@ var (
 	testTmpPath = filepath.Join(tmpdir, "test.tmp")
 )
 
-func createTestTxn(t *testing.T) *Txn {
+func createTestStorage(t *testing.T) *Storage {
 	_ = os.RemoveAll(tmpdir)
 	_ = os.MkdirAll(tmpdir, 0777)
 	file, err := os.OpenFile(testWALPath, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0600)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return NewTxn(file, testDBPath, testTmpPath)
+	return NewStorage(file, testDBPath, testTmpPath)
 }
 
 func TestTxn_Insert(t *testing.T) {
@@ -37,8 +37,9 @@ func TestTxn_Insert(t *testing.T) {
 		value3 = []byte("value3")
 	)
 	t.Run("normal case", func(t *testing.T) {
-		txn := createTestTxn(t)
-		defer txn.wal.Close()
+		storage := createTestStorage(t)
+		defer storage.wal.Close()
+		txn := storage.NewTxn()
 		if err := txn.Insert("key1", value1); err != nil {
 			t.Errorf("failed to insert key1 : %v", err)
 		}
@@ -59,8 +60,9 @@ func TestTxn_Insert(t *testing.T) {
 	})
 
 	t.Run("insert after delete", func(t *testing.T) {
-		txn := createTestTxn(t)
-		defer txn.wal.Close()
+		storage := createTestStorage(t)
+		defer storage.wal.Close()
+		txn := storage.NewTxn()
 		if err := txn.Insert("key1", value1); err != nil {
 			t.Errorf("failed to insert key1 : %v", err)
 		}
@@ -83,8 +85,9 @@ func TestTxn_Insert(t *testing.T) {
 }
 
 func TestTxn_Read(t *testing.T) {
-	txn := createTestTxn(t)
-	defer txn.wal.Close()
+	storage := createTestStorage(t)
+	defer storage.wal.Close()
+	txn := storage.NewTxn()
 	value1 := []byte("value1")
 	if _, err := txn.Read("key1"); err != ErrNotExist {
 		t.Errorf("key1 is not (not exist) : %v", err)
@@ -100,8 +103,9 @@ func TestTxn_Read(t *testing.T) {
 }
 
 func TestTxn_Update(t *testing.T) {
-	txn := createTestTxn(t)
-	defer txn.wal.Close()
+	storage := createTestStorage(t)
+	defer storage.wal.Close()
+	txn := storage.NewTxn()
 	var (
 		value1 = []byte("value1")
 		value2 = []byte("value2")
@@ -141,8 +145,9 @@ func TestTxn_Delete(t *testing.T) {
 		value1 = []byte("value1")
 	)
 	t.Run("normal case", func(t *testing.T) {
-		txn := createTestTxn(t)
-		defer txn.wal.Close()
+		storage := createTestStorage(t)
+		defer storage.wal.Close()
+		txn := storage.NewTxn()
 		if err := txn.Delete("key1"); err != ErrNotExist {
 			t.Errorf("key1 is not (not exist) : %v", err)
 		}
@@ -161,8 +166,9 @@ func TestTxn_Delete(t *testing.T) {
 	})
 
 	t.Run("delete after commit", func(t *testing.T) {
-		txn := createTestTxn(t)
-		defer txn.wal.Close()
+		storage := createTestStorage(t)
+		defer storage.wal.Close()
+		txn := storage.NewTxn()
 		if err := txn.Insert("key1", value1); err != nil {
 			t.Errorf("failed to insert key1 : %v", err)
 		}
@@ -181,8 +187,9 @@ func TestTxn_Delete(t *testing.T) {
 }
 
 func TestTxn_Commit(t *testing.T) {
-	txn := createTestTxn(t)
-	defer txn.wal.Close()
+	storage := createTestStorage(t)
+	defer storage.wal.Close()
+	txn := storage.NewTxn()
 	var (
 		value1 = []byte("value1")
 		value2 = []byte("value2")
@@ -237,8 +244,9 @@ func TestTxn_Abort(t *testing.T) {
 		value2 = []byte("value2")
 	)
 	t.Run("abort insert", func(t *testing.T) {
-		txn := createTestTxn(t)
-		defer txn.wal.Close()
+		storage := createTestStorage(t)
+		defer storage.wal.Close()
+		txn := storage.NewTxn()
 		if err := txn.Insert("key1", value1); err != nil {
 			t.Errorf("failed to insert key1 : %v", err)
 		}
@@ -249,8 +257,9 @@ func TestTxn_Abort(t *testing.T) {
 	})
 
 	t.Run("abort update", func(t *testing.T) {
-		txn := createTestTxn(t)
-		defer txn.wal.Close()
+		storage := createTestStorage(t)
+		defer storage.wal.Close()
+		txn := storage.NewTxn()
 		if err := txn.Insert("key1", value1); err != nil {
 			t.Errorf("failed to insert key1 : %v", err)
 		}
@@ -270,8 +279,9 @@ func TestTxn_Abort(t *testing.T) {
 	})
 
 	t.Run("abort delete", func(t *testing.T) {
-		txn := createTestTxn(t)
-		defer txn.wal.Close()
+		storage := createTestStorage(t)
+		defer storage.wal.Close()
+		txn := storage.NewTxn()
 		if err := txn.Insert("key1", value1); err != nil {
 			t.Errorf("failed to insert key1 : %v", err)
 		}
@@ -378,8 +388,9 @@ func applyLogs(t *testing.T, txn *Txn, logs []RecordLog) {
 }
 
 func TestWAL(t *testing.T) {
-	txn := createTestTxn(t)
-	defer txn.wal.Close()
+	storage := createTestStorage(t)
+	defer storage.wal.Close()
+	txn := storage.NewTxn()
 	logs := []RecordLog{
 		{Action: LCommit},
 		{Action: LInsert, Record: Record{Key: "key1", Value: []byte("value1")}},
@@ -398,7 +409,7 @@ func TestWAL(t *testing.T) {
 	}
 	applyLogs(t, txn, logs)
 
-	rest, logsInFile := readLogs(t, txn.wal.Name())
+	rest, logsInFile := readLogs(t, storage.wal.Name())
 	if len(rest) != 0 {
 		t.Fatalf("log file is bigger than expected : %v", rest)
 	} else if len(logsInFile) != len(logs) {
@@ -411,11 +422,11 @@ func TestWAL(t *testing.T) {
 	}
 }
 
-func TestTxn_LoadWAL(t *testing.T) {
+func TestStorage_LoadWAL(t *testing.T) {
 	t.Run("empty WAL", func(t *testing.T) {
-		txn := createTestTxn(t)
-		defer txn.wal.Close()
-		if n, err := txn.LoadWAL(); err != nil {
+		storage := createTestStorage(t)
+		defer storage.wal.Close()
+		if n, err := storage.LoadWAL(); err != nil {
 			t.Errorf("failed to load : %v", err)
 		} else if n != 0 {
 			t.Errorf("load wal %v logs, expected 0", n)
@@ -439,12 +450,13 @@ func TestTxn_LoadWAL(t *testing.T) {
 			{Action: LInsert, Record: Record{Key: "key3", Value: []byte("value9")}},
 			{Action: LCommit},
 		}
-		txn := createTestTxn(t)
-		defer txn.wal.Close()
+		storage := createTestStorage(t)
+		defer storage.wal.Close()
+		txn := storage.NewTxn()
 		// write log to WAL file
-		writeLogs(t, txn.wal, logs)
+		writeLogs(t, storage.wal, logs)
 
-		if n, err := txn.LoadWAL(); err != nil {
+		if n, err := storage.LoadWAL(); err != nil {
 			t.Errorf("failed to load : %v", err)
 		} else if n != len(logs) {
 			t.Errorf("load wal %v logs, expected %v", n, len(logs))
@@ -455,9 +467,9 @@ func TestTxn_LoadWAL(t *testing.T) {
 		assertValue(t, txn, "key4", []byte("value7"))
 
 		// check idenpotency
-		clearFile(t, txn.wal)
-		writeLogs(t, txn.wal, logs)
-		if n, err := txn.LoadWAL(); err != nil {
+		clearFile(t, storage.wal)
+		writeLogs(t, storage.wal, logs)
+		if n, err := storage.LoadWAL(); err != nil {
 			t.Errorf("failed to load : %v", err)
 		} else if n != len(logs) {
 			t.Errorf("load wal %v logs, expected %v", n, len(logs))
@@ -484,12 +496,13 @@ func TestTxn_LoadWAL(t *testing.T) {
 			{Action: LDelete, Record: Record{Key: "key2", Value: []byte("")}}, // TODO: delete log not need to have value
 			{Action: LInsert, Record: Record{Key: "key3", Value: []byte("value9")}},
 		}
-		txn := createTestTxn(t)
-		defer txn.wal.Close()
+		storage := createTestStorage(t)
+		defer storage.wal.Close()
+		txn := storage.NewTxn()
 		// write log to WAL file
-		writeLogs(t, txn.wal, logs)
+		writeLogs(t, storage.wal, logs)
 
-		if n, err := txn.LoadWAL(); err != nil {
+		if n, err := storage.LoadWAL(); err != nil {
 			t.Errorf("failed to load : %v", err)
 		} else if n != len(logs) {
 			t.Errorf("load wal %v logs, expected %v", n, len(logs))
@@ -500,9 +513,9 @@ func TestTxn_LoadWAL(t *testing.T) {
 		assertValue(t, txn, "key4", []byte("value7"))
 
 		// check idenpotency
-		clearFile(t, txn.wal)
-		writeLogs(t, txn.wal, logs)
-		if n, err := txn.LoadWAL(); err != nil {
+		clearFile(t, storage.wal)
+		writeLogs(t, storage.wal, logs)
+		if n, err := storage.LoadWAL(); err != nil {
 			t.Errorf("failed to load : %v", err)
 		} else if n != len(logs) {
 			t.Errorf("load wal %v logs, expected %v", n, len(logs))
@@ -514,25 +527,25 @@ func TestTxn_LoadWAL(t *testing.T) {
 	})
 }
 
-func TestTxn_ClearWAL(t *testing.T) {
+func TestStorage_ClearWAL(t *testing.T) {
 	logs := []RecordLog{
 		{Action: LInsert, Record: Record{Key: "key1", Value: []byte("value1")}},
 		{Action: LInsert, Record: Record{Key: "key2", Value: []byte("value2")}},
 		{Action: LInsert, Record: Record{Key: "key3", Value: []byte("value3")}},
 		{Action: LCommit},
 	}
-	txn := createTestTxn(t)
-	defer txn.wal.Close()
-	writeLogs(t, txn.wal, logs)
+	storage := createTestStorage(t)
+	defer storage.wal.Close()
+	writeLogs(t, storage.wal, logs)
 
-	if err := txn.ClearWAL(); err != nil {
+	if err := storage.ClearWAL(); err != nil {
 		t.Errorf("failed to clearWAL : %v", err)
 	}
 
 	// rewrite from the offset ClearWAL set (must be 0)
-	writeLogs(t, txn.wal, logs)
+	writeLogs(t, storage.wal, logs)
 
-	rest, logsInFile := readLogs(t, txn.wal.Name())
+	rest, logsInFile := readLogs(t, storage.wal.Name())
 	if len(rest) != 0 {
 		t.Fatalf("log file is bigger than expected : %v", rest)
 	} else if len(logsInFile) != len(logs) {
@@ -545,7 +558,7 @@ func TestTxn_ClearWAL(t *testing.T) {
 	}
 }
 
-func TestTxn_SaveCheckPoint(t *testing.T) {
+func TestStorage_SaveCheckPoint(t *testing.T) {
 	logs := []RecordLog{
 		{Action: LCommit},
 		{Action: LInsert, Record: Record{Key: "key1", Value: []byte("value1")}},
@@ -562,11 +575,12 @@ func TestTxn_SaveCheckPoint(t *testing.T) {
 		{Action: LInsert, Record: Record{Key: "key3", Value: []byte("value9")}},
 		{Action: LCommit},
 	}
-	txn := createTestTxn(t)
-	defer txn.wal.Close()
+	storage := createTestStorage(t)
+	defer storage.wal.Close()
+	txn := storage.NewTxn()
 	applyLogs(t, txn, logs)
 
-	if err := txn.SaveCheckPoint(); err != nil {
+	if err := storage.SaveCheckPoint(); err != nil {
 		t.Errorf("failed to save checkpoint : %v", err)
 	}
 
@@ -575,11 +589,11 @@ func TestTxn_SaveCheckPoint(t *testing.T) {
 	if err != nil {
 		t.Errorf("failed to open wal file : %v", err)
 	}
-	txn2 := NewTxn(wal2, testDBPath, testTmpPath)
-	if err = txn2.LoadCheckPoint(); err != nil {
+	storage2 := NewStorage(wal2, testDBPath, testTmpPath)
+	if err = storage2.LoadCheckPoint(); err != nil {
 		t.Errorf("failed to load checkpoint : %v", err)
 	}
-	if !reflect.DeepEqual(txn2.db, txn.db) {
+	if !reflect.DeepEqual(storage2.db, storage2.db) {
 		t.Errorf("loaded records not match")
 	}
 }

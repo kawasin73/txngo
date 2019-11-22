@@ -148,27 +148,79 @@ type RecordCache struct {
 	deleted bool
 }
 
+type Storage struct {
+	dbPath  string
+	tmpPath string
+	wal     *os.File
+	db      map[string]Record
+}
+
 type Txn struct {
-	dbPath   string
-	tmpPath  string
-	wal      *os.File
-	db       map[string]Record
+	s        *Storage
 	logs     []RecordLog
 	writeSet map[string]RecordCache
 }
 
-func NewTxn(wal *os.File, dbPath, tmpPath string) *Txn {
+func NewStorage(wal *os.File, dbPath, tmpPath string) *Storage {
+	return &Storage{
+		dbPath:  dbPath,
+		tmpPath: tmpPath,
+		wal:     wal,
+		db:      make(map[string]Record),
+	}
+}
+
+func (s *Storage) NewTxn() *Txn {
 	return &Txn{
-		dbPath:   dbPath,
-		tmpPath:  tmpPath,
-		wal:      wal,
-		db:       make(map[string]Record),
+		s:        s,
 		writeSet: make(map[string]RecordCache),
 	}
 }
 
-func (txn *Txn) LoadWAL() (int, error) {
-	if _, err := txn.wal.Seek(0, io.SeekStart); err != nil {
+func (s *Storage) SaveLogs(logs []RecordLog) error {
+	var (
+		i   int
+		buf [4096]byte
+	)
+
+	for _, rlog := range logs {
+		n, err := rlog.Serialize(buf[i:])
+		if err == ErrBufferShort {
+			// TODO: use writev
+			return err
+		} else if err != nil {
+			return err
+		}
+
+		// TODO: delay write and combine multi log into one buffer
+		_, err = s.wal.Write(buf[:n])
+		if err != nil {
+			return err
+		}
+	}
+
+	// write commit log
+	n, err := (&RecordLog{Action: LCommit}).Serialize(buf[:])
+	if err != nil {
+		// commit log serialization must not fail
+		log.Panic(err)
+	}
+	_, err = s.wal.Write(buf[:n])
+	if err != nil {
+		return err
+	}
+
+	// sync this transaction
+	err = s.wal.Sync()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *Storage) LoadWAL() (int, error) {
+	if _, err := s.wal.Seek(0, io.SeekStart); err != nil {
 		return 0, err
 	}
 
@@ -181,7 +233,7 @@ func (txn *Txn) LoadWAL() (int, error) {
 
 	// redo all record logs in WAL file
 	for {
-		n, err := txn.wal.Read(buf[size:])
+		n, err := s.wal.Read(buf[size:])
 		size += n
 		if err == io.EOF {
 			break
@@ -221,20 +273,20 @@ func (txn *Txn) LoadWAL() (int, error) {
 				for _, rlog := range logs {
 					switch rlog.Action {
 					case LInsert:
-						txn.db[rlog.Key] = rlog.Record
+						s.db[rlog.Key] = rlog.Record
 
 					case LUpdate:
 						// reuse Key string in db and Key in rlog will be GCed.
-						r, ok := txn.db[rlog.Key]
+						r, ok := s.db[rlog.Key]
 						if !ok {
 							// record in db may be sometimes deleted. complete with rlog.Key for idempotency.
 							r.Key = rlog.Key
 						}
 						r.Value = rlog.Value
-						txn.db[r.Key] = r
+						s.db[r.Key] = r
 
 					case LDelete:
-						delete(txn.db, rlog.Key)
+						delete(s.db, rlog.Key)
 					}
 				}
 				// clear logs
@@ -252,21 +304,21 @@ func (txn *Txn) LoadWAL() (int, error) {
 	return nlogs, nil
 }
 
-func (txn *Txn) ClearWAL() error {
-	if _, err := txn.wal.Seek(0, io.SeekStart); err != nil {
+func (s *Storage) ClearWAL() error {
+	if _, err := s.wal.Seek(0, io.SeekStart); err != nil {
 		return err
-	} else if err = txn.wal.Truncate(0); err != nil {
+	} else if err = s.wal.Truncate(0); err != nil {
 		return err
 		// it is not obvious that ftruncate(2) sync the change to disk or not. sync explicitly for safe.
-	} else if err = txn.wal.Sync(); err != nil {
+	} else if err = s.wal.Sync(); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (txn *Txn) SaveCheckPoint() error {
+func (s *Storage) SaveCheckPoint() error {
 	// create temporary checkout file
-	f, err := os.Create(txn.tmpPath)
+	f, err := os.Create(s.tmpPath)
 	if err != nil {
 		return err
 	}
@@ -274,14 +326,14 @@ func (txn *Txn) SaveCheckPoint() error {
 
 	var buf [4096]byte
 	// write header
-	binary.BigEndian.PutUint32(buf[:4], uint32(len(txn.db)))
+	binary.BigEndian.PutUint32(buf[:4], uint32(len(s.db)))
 	_, err = f.Write(buf[:4])
 	if err != nil {
 		goto ERROR
 	}
 
 	// write all data
-	for _, r := range txn.db {
+	for _, r := range s.db {
 		// FIXME: key order in map will be randomized
 		n, err := r.Serialize(buf[:])
 		if err == ErrBufferShort {
@@ -303,7 +355,7 @@ func (txn *Txn) SaveCheckPoint() error {
 	}
 
 	// swap dbfile and temporary file
-	err = os.Rename(txn.tmpPath, txn.dbPath)
+	err = os.Rename(s.tmpPath, s.dbPath)
 	if err != nil {
 		goto ERROR
 	}
@@ -311,14 +363,14 @@ func (txn *Txn) SaveCheckPoint() error {
 	return nil
 
 ERROR:
-	if rerr := os.Remove(txn.tmpPath); rerr != nil {
+	if rerr := os.Remove(s.tmpPath); rerr != nil {
 		log.Println("failed to remove temporary file for checkpoint :", rerr)
 	}
 	return err
 }
 
-func (txn *Txn) LoadCheckPoint() error {
-	f, err := os.Open(txn.dbPath)
+func (s *Storage) LoadCheckPoint() error {
+	f, err := os.Open(s.dbPath)
 	if err != nil {
 		return err
 	}
@@ -382,7 +434,7 @@ func (txn *Txn) LoadCheckPoint() error {
 			head += n
 
 			// set data
-			txn.db[r.Key] = r
+			s.db[r.Key] = r
 			loaded++
 		}
 		// move data to head
@@ -406,7 +458,7 @@ func (txn *Txn) Read(key string) ([]byte, error) {
 		return r.Value, nil
 	}
 
-	r, ok := txn.db[key]
+	r, ok := txn.s.db[key]
 	if !ok {
 		return nil, ErrNotExist
 	}
@@ -430,7 +482,7 @@ func (txn *Txn) Insert(key string, value []byte) error {
 		key = r.Key
 	} else {
 		// check that the key not exists in db
-		if _, ok := txn.db[key]; ok {
+		if _, ok := txn.s.db[key]; ok {
 			return ErrExist
 		}
 		// reallocate string
@@ -469,7 +521,7 @@ func (txn *Txn) Update(key string, value []byte) error {
 		key = r.Key
 	} else {
 		// check that the key exists in db
-		r, ok := txn.db[key]
+		r, ok := txn.s.db[key]
 		if !ok {
 			return ErrNotExist
 		}
@@ -508,7 +560,7 @@ func (txn *Txn) Delete(key string) error {
 		key = r.Key
 	} else {
 		// check that the key exists in db
-		r, ok := txn.db[key]
+		r, ok := txn.s.db[key]
 		if !ok {
 			return ErrNotExist
 		}
@@ -539,40 +591,7 @@ func (txn *Txn) Commit() error {
 	//	// no need to write WAL
 	//	return nil
 	//}
-	var (
-		i   int
-		buf [4096]byte
-	)
-
-	for _, rlog := range txn.logs {
-		n, err := rlog.Serialize(buf[i:])
-		if err == ErrBufferShort {
-			// TODO: use writev
-			return err
-		} else if err != nil {
-			return err
-		}
-
-		// TODO: delay write and combine multi log into one buffer
-		_, err = txn.wal.Write(buf[:n])
-		if err != nil {
-			return err
-		}
-	}
-
-	// write commit log
-	n, err := (&RecordLog{Action: LCommit}).Serialize(buf[:])
-	if err != nil {
-		// commit log serialization must not fail
-		log.Panic(err)
-	}
-	_, err = txn.wal.Write(buf[:n])
-	if err != nil {
-		return err
-	}
-
-	// sync this transaction
-	err = txn.wal.Sync()
+	err := txn.s.SaveLogs(txn.logs)
 	if err != nil {
 		return err
 	}
@@ -580,9 +599,9 @@ func (txn *Txn) Commit() error {
 	// write back writeSet to db (in memory)
 	for _, r := range txn.writeSet {
 		if r.deleted {
-			delete(txn.db, r.Key)
+			delete(txn.s.db, r.Key)
 		} else {
-			txn.db[r.Key] = r.Record
+			txn.s.db[r.Key] = r.Record
 		}
 
 		// remove from writeSet
@@ -619,10 +638,11 @@ func main() {
 	}
 	defer wal.Close()
 
-	txn := NewTxn(wal, *dbPath, *dbPath+".tmp")
+	storage := NewStorage(wal, *dbPath, *dbPath+".tmp")
+	txn := storage.NewTxn()
 
 	log.Println("loading data file...")
-	if err = txn.LoadCheckPoint(); os.IsNotExist(err) && *isInit {
+	if err = storage.LoadCheckPoint(); os.IsNotExist(err) && *isInit {
 		log.Println("db file is not found. this is initial start.")
 	} else if err != nil {
 		log.Printf("failed to load data file : %v\n", err)
@@ -630,18 +650,18 @@ func main() {
 	}
 
 	log.Println("loading WAL file...")
-	if nlogs, err := txn.LoadWAL(); err != nil {
+	if nlogs, err := storage.LoadWAL(); err != nil {
 		log.Printf("failed to load WAL file : %v\n", err)
 		return
 	} else if nlogs != 0 {
 		log.Println("previous shutdown is not success...")
 		log.Println("update data file...")
-		if err = txn.SaveCheckPoint(); err != nil {
+		if err = storage.SaveCheckPoint(); err != nil {
 			log.Printf("failed to save checkpoint %v\n", err)
 			return
 		}
 		log.Println("clear WAL file...")
-		if err = txn.ClearWAL(); err != nil {
+		if err = storage.ClearWAL(); err != nil {
 			log.Printf("failed to clear WAL file %v\n", err)
 			return
 		}
@@ -650,9 +670,9 @@ func main() {
 	defer func() {
 		log.Println("shutdown...")
 
-		if err = txn.SaveCheckPoint(); err != nil {
+		if err = storage.SaveCheckPoint(); err != nil {
 			log.Printf("failed to save data file : %v\n", err)
-		} else if err = txn.ClearWAL(); err != nil {
+		} else if err = storage.ClearWAL(); err != nil {
 			log.Printf("failed to clear WAL file : %v\n", err)
 		} else {
 			log.Println("success to save data")
@@ -732,7 +752,7 @@ func main() {
 				fmt.Println("invalid command : keys")
 			} else {
 				fmt.Println(">>> show keys commited <<<")
-				for k, _ := range txn.db {
+				for k, _ := range storage.db {
 					fmt.Println(k)
 				}
 			}
