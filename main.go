@@ -9,10 +9,13 @@ import (
 	"hash/crc32"
 	"io"
 	"log"
+	"net"
 	"os"
+	"os/signal"
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -701,10 +704,105 @@ func (txn *Txn) Abort() {
 	txn.logs = nil
 }
 
+func HandleTxn(r io.Reader, w io.WriteCloser, txn *Txn, storage *Storage, closeOnExit bool, wg *sync.WaitGroup) error {
+	if closeOnExit {
+		defer w.Close()
+		defer wg.Done()
+	}
+	reader := bufio.NewReader(r)
+	for {
+		fmt.Fprintf(w, ">> ")
+		txt, err := reader.ReadString('\n')
+		if err != nil {
+			fmt.Fprintf(w, "failed to read command : %v\n", err)
+			return err
+		}
+
+		txt = strings.TrimSpace(txt)
+		cmd := strings.Split(txt, " ")
+		if len(cmd) == 0 || len(cmd[0]) == 0 {
+			continue
+		}
+		switch strings.ToLower(cmd[0]) {
+		case "insert":
+			if len(cmd) != 3 {
+				fmt.Fprintf(w, "invalid command : insert <key> <value>\n")
+			} else if err = txn.Insert(cmd[1], []byte(cmd[2])); err != nil {
+				fmt.Fprintf(w, "failed to insert : %v\n", err)
+			} else {
+				fmt.Fprintf(w, "success to insert %q\n", cmd[1])
+			}
+
+		case "update":
+			if len(cmd) != 3 {
+				fmt.Fprintf(w, "invalid command : update <key> <value>\n")
+			} else if err = txn.Update(cmd[1], []byte(cmd[2])); err != nil {
+				fmt.Fprintf(w, "failed to update : %v\n", err)
+			} else {
+				fmt.Fprintf(w, "success to update %q\n", cmd[1])
+			}
+
+		case "delete":
+			if len(cmd) != 2 {
+				fmt.Fprintf(w, "invalid command : delete <key>\n")
+			} else if err = txn.Delete(cmd[1]); err != nil {
+				fmt.Fprintf(w, "failed to delete : %v\n", err)
+			} else {
+				fmt.Fprintf(w, "success to delete %q\n", cmd[1])
+			}
+
+		case "read":
+			if len(cmd) != 2 {
+				fmt.Fprintf(w, "invalid command : read <key>\n")
+			} else if v, err := txn.Read(cmd[1]); err != nil {
+				fmt.Fprintf(w, "failed to read : %v\n", err)
+			} else {
+				fmt.Fprintf(w, "%v\n", string(v))
+			}
+
+		case "commit":
+			if len(cmd) != 1 {
+				fmt.Fprintf(w, "invalid command : commit\n")
+			} else if err = txn.Commit(); err != nil {
+				fmt.Fprintf(w, "failed to commit : %v\n", err)
+			} else {
+				fmt.Fprintf(w, "committed\n")
+			}
+
+		case "abort":
+			if len(cmd) != 1 {
+				fmt.Fprintf(w, "invalid command : abort\n")
+			} else {
+				txn.Abort()
+				fmt.Fprintf(w, "aborted\n")
+			}
+
+		case "keys":
+			if len(cmd) != 1 {
+				fmt.Fprintf(w, "invalid command : keys\n")
+			} else {
+				fmt.Fprintf(w, ">>> show keys commited <<<\n")
+				for k, _ := range storage.db {
+					fmt.Fprintf(w, "%s\n", k)
+				}
+			}
+
+		case "quit", "exit", "q":
+			fmt.Fprintf(w, "byebye\n")
+			txn.Abort()
+			return nil
+
+		default:
+			fmt.Fprintf(w, "invalid command : not supported\n")
+		}
+	}
+}
+
 func main() {
 	walPath := flag.String("wal", "./txngo.log", "file path of WAL file")
 	dbPath := flag.String("db", "./txngo.db", "file path of data file")
 	isInit := flag.Bool("init", true, "create data file if not exist")
+	tcpaddr := flag.String("tcp", "", "tcp handler address (e.g. localhost:3000)")
 
 	flag.Parse()
 
@@ -718,7 +816,6 @@ func main() {
 	defer wal.Close()
 
 	storage := NewStorage(wal, *dbPath, *dbPath+".tmp")
-	txn := storage.NewTxn()
 
 	log.Println("loading data file...")
 	if err = storage.LoadCheckPoint(); os.IsNotExist(err) && *isInit {
@@ -746,103 +843,66 @@ func main() {
 		}
 	}
 
-	defer func() {
-		log.Println("shutdown...")
+	log.Println("start transactions")
 
-		if err = storage.SaveCheckPoint(); err != nil {
-			log.Printf("failed to save data file : %v\n", err)
-		} else if err = storage.ClearWAL(); err != nil {
-			log.Printf("failed to clear WAL file : %v\n", err)
-		} else {
-			log.Println("success to save data")
-		}
-	}()
-
-	reader := bufio.NewReader(os.Stdin)
-	for {
-		fmt.Printf(">> ")
-		txt, err := reader.ReadString('\n')
+	if *tcpaddr == "" {
+		// stdio handler
+		txn := storage.NewTxn()
+		err = HandleTxn(os.Stdin, os.Stdout, txn, storage, false, nil)
 		if err != nil {
-			fmt.Printf("failed to read command : %v", err)
-			break
+			log.Println("failed to handle", err)
 		}
-
-		txt = strings.TrimSpace(txt)
-		cmd := strings.Split(txt, " ")
-		if len(cmd) == 0 || len(cmd[0]) == 0 {
-			continue
-		}
-		switch strings.ToLower(cmd[0]) {
-		case "insert":
-			if len(cmd) != 3 {
-				fmt.Println("invalid command : insert <key> <value>")
-			} else if err = txn.Insert(cmd[1], []byte(cmd[2])); err != nil {
-				fmt.Printf("failed to insert : %v\n", err)
-			} else {
-				fmt.Printf("success to insert %q\n", cmd[1])
-			}
-
-		case "update":
-			if len(cmd) != 3 {
-				fmt.Println("invalid command : update <key> <value>")
-			} else if err = txn.Update(cmd[1], []byte(cmd[2])); err != nil {
-				fmt.Printf("failed to update : %v\n", err)
-			} else {
-				fmt.Printf("success to update %q\n", cmd[1])
-			}
-
-		case "delete":
-			if len(cmd) != 2 {
-				fmt.Println("invalid command : delete <key>")
-			} else if err = txn.Delete(cmd[1]); err != nil {
-				fmt.Printf("failed to delete : %v\n", err)
-			} else {
-				fmt.Printf("success to delete %q\n", cmd[1])
-			}
-
-		case "read":
-			if len(cmd) != 2 {
-				fmt.Println("invalid command : read <key>")
-			} else if v, err := txn.Read(cmd[1]); err != nil {
-				fmt.Printf("failed to read : %v\n", err)
-			} else {
-				fmt.Printf("%v\n", string(v))
-			}
-
-		case "commit":
-			if len(cmd) != 1 {
-				fmt.Println("invalid command : commit")
-			} else if err = txn.Commit(); err != nil {
-				fmt.Printf("failed to commit : %v\n", err)
-			} else {
-				fmt.Println("committed")
-			}
-
-		case "abort":
-			if len(cmd) != 1 {
-				fmt.Println("invalid command : abort")
-			} else {
-				txn.Abort()
-				fmt.Println("aborted")
-			}
-
-		case "keys":
-			if len(cmd) != 1 {
-				fmt.Println("invalid command : keys")
-			} else {
-				fmt.Println(">>> show keys commited <<<")
-				for k, _ := range storage.db {
-					fmt.Println(k)
-				}
-			}
-
-		case "quit", "exit", "q":
-			fmt.Println("byebye")
+		log.Println("shutdown...")
+	} else {
+		// tcp handler
+		l, err := net.Listen("tcp", *tcpaddr)
+		if err != nil {
+			log.Println("failed to listen tcp :", err)
 			return
+		}
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				conn, err := l.Accept()
+				if err != nil {
+					log.Println("failed to accept tcp :", err)
+					break
+				}
+				log.Println("accept new conn :", conn.RemoteAddr())
+				txn := storage.NewTxn()
+				wg.Add(1)
+				go HandleTxn(conn, conn, txn, storage, true, &wg)
+			}
+		}()
 
-		default:
-			fmt.Println("invalid command : not supported")
+		signal.Reset()
+		chsig := make(chan os.Signal)
+		signal.Notify(chsig, os.Interrupt)
+		<-chsig
+		log.Println("shutdown...")
+		l.Close()
+
+		chDone := make(chan struct{})
+		go func() {
+			wg.Wait()
+			chDone <- struct{}{}
+		}()
+		select {
+		case <-time.After(30 * time.Second):
+			log.Println("connection not quit. shutdown forcibly.")
+			return
+		case <-chDone:
 		}
 	}
 
+	log.Println("save checkpoint")
+	if err = storage.SaveCheckPoint(); err != nil {
+		log.Printf("failed to save data file : %v\n", err)
+	} else if err = storage.ClearWAL(); err != nil {
+		log.Printf("failed to clear WAL file : %v\n", err)
+	} else {
+		log.Println("success to save data")
+	}
 }
