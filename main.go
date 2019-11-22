@@ -12,6 +12,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 )
 
 const (
@@ -148,11 +149,67 @@ type RecordCache struct {
 	deleted bool
 }
 
+type lock struct {
+	mu   sync.RWMutex
+	refs int
+}
+
+type Locker struct {
+	mutexes map[string]*lock
+}
+
+func NewLocker() *Locker {
+	return &Locker{
+		mutexes: make(map[string]*lock),
+	}
+}
+
+func (l *Locker) refLock(key string) *lock {
+	rec, ok := l.mutexes[key]
+	if !ok {
+		// TODO: not create lock object each time, use Pool or preallocate for each record
+		rec = new(lock)
+		l.mutexes[key] = rec
+	}
+	rec.refs++
+	return rec
+}
+
+func (l *Locker) unrefLock(key string) *lock {
+	rec := l.mutexes[key]
+	rec.refs--
+	if rec.refs == 0 {
+		delete(l.mutexes, key)
+	}
+	return rec
+}
+
+func (l *Locker) Lock(key string) {
+	rec := l.refLock(key)
+	rec.mu.Lock()
+}
+
+func (l *Locker) Unlock(key string) {
+	rec := l.unrefLock(key)
+	rec.mu.Unlock()
+}
+
+func (l *Locker) RLock(key string) {
+	rec := l.refLock(key)
+	rec.mu.RLock()
+}
+
+func (l *Locker) RUnlock(key string) {
+	rec := l.unrefLock(key)
+	rec.mu.RUnlock()
+}
+
 type Storage struct {
 	dbPath  string
 	tmpPath string
 	wal     *os.File
 	db      map[string]Record
+	lock    *Locker
 }
 
 type Txn struct {
@@ -167,6 +224,7 @@ func NewStorage(wal *os.File, dbPath, tmpPath string) *Storage {
 		tmpPath: tmpPath,
 		wal:     wal,
 		db:      make(map[string]Record),
+		lock:    NewLocker(),
 	}
 }
 
@@ -456,6 +514,9 @@ func (txn *Txn) Read(key string) ([]byte, error) {
 			return nil, ErrNotExist
 		}
 		return r.Value, nil
+	} else {
+		txn.s.lock.RLock(key)
+		defer txn.s.lock.RUnlock(key)
 	}
 
 	r, ok := txn.s.db[key]
@@ -481,8 +542,12 @@ func (txn *Txn) Insert(key string, value []byte) error {
 		// reuse key in writeSet
 		key = r.Key
 	} else {
+		// lock record
+		txn.s.lock.Lock(key)
+
 		// check that the key not exists in db
 		if _, ok := txn.s.db[key]; ok {
+			txn.s.lock.Unlock(key)
 			return ErrExist
 		}
 		// reallocate string
@@ -520,9 +585,13 @@ func (txn *Txn) Update(key string, value []byte) error {
 		// reuse key in writeSet
 		key = r.Key
 	} else {
+		// lock record
+		txn.s.lock.Lock(key)
+
 		// check that the key exists in db
 		r, ok := txn.s.db[key]
 		if !ok {
+			txn.s.lock.Unlock(key)
 			return ErrNotExist
 		}
 		// reuse key in db
@@ -559,9 +628,13 @@ func (txn *Txn) Delete(key string) error {
 		// reuse key in writeSet
 		key = r.Key
 	} else {
+		// lock record
+		txn.s.lock.Lock(key)
+
 		// check that the key exists in db
 		r, ok := txn.s.db[key]
 		if !ok {
+			txn.s.lock.Unlock(key)
 			return ErrNotExist
 		}
 		// reuse key in db
@@ -604,6 +677,9 @@ func (txn *Txn) Commit() error {
 			txn.s.db[r.Key] = r.Record
 		}
 
+		// unlock record
+		txn.s.lock.Unlock(r.Key)
+
 		// remove from writeSet
 		delete(txn.writeSet, r.Key)
 	}
@@ -617,6 +693,9 @@ func (txn *Txn) Commit() error {
 
 func (txn *Txn) Abort() {
 	for k := range txn.writeSet {
+		// unlock record
+		txn.s.lock.Unlock(k)
+
 		delete(txn.writeSet, k)
 	}
 	txn.logs = nil
