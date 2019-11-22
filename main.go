@@ -149,11 +149,6 @@ func (r *RecordLog) Deserialize(buf []byte) (int, error) {
 	return total + 4, nil
 }
 
-type RecordCache struct {
-	Record
-	deleted bool
-}
-
 type lock struct {
 	mu   sync.RWMutex
 	refs int
@@ -210,6 +205,7 @@ func (l *Locker) RUnlock(key string) {
 }
 
 type Storage struct {
+	muWAL   sync.Mutex
 	dbPath  string
 	tmpPath string
 	wal     *os.File
@@ -220,7 +216,7 @@ type Storage struct {
 type Txn struct {
 	s        *Storage
 	logs     []RecordLog
-	writeSet map[string]RecordCache
+	writeSet map[string]int
 }
 
 func NewStorage(wal *os.File, dbPath, tmpPath string) *Storage {
@@ -236,11 +232,38 @@ func NewStorage(wal *os.File, dbPath, tmpPath string) *Storage {
 func (s *Storage) NewTxn() *Txn {
 	return &Txn{
 		s:        s,
-		writeSet: make(map[string]RecordCache),
+		writeSet: make(map[string]int),
 	}
 }
 
-func (s *Storage) SaveLogs(logs []RecordLog) error {
+func (s *Storage) ApplyLogs(logs []RecordLog) {
+	// TODO: optimize when duplicate keys in logs
+	for _, rlog := range logs {
+		switch rlog.Action {
+		case LInsert:
+			s.db[rlog.Key] = rlog.Record
+
+		case LUpdate:
+			// reuse Key string in db and Key in rlog will be GCed.
+			r, ok := s.db[rlog.Key]
+			if !ok {
+				// record in db may be sometimes deleted. complete with rlog.Key for idempotency.
+				r.Key = rlog.Key
+			}
+			r.Value = rlog.Value
+			s.db[r.Key] = r
+
+		case LDelete:
+			delete(s.db, rlog.Key)
+		}
+	}
+}
+
+func (s *Storage) SaveWAL(logs []RecordLog) error {
+	// prevent parallel WAL writing by unexpected context switch
+	s.muWAL.Lock()
+	defer s.muWAL.Unlock()
+
 	var (
 		i   int
 		buf [4096]byte
@@ -333,25 +356,8 @@ func (s *Storage) LoadWAL() (int, error) {
 
 			case LCommit:
 				// redo record logs
-				for _, rlog := range logs {
-					switch rlog.Action {
-					case LInsert:
-						s.db[rlog.Key] = rlog.Record
+				s.ApplyLogs(logs)
 
-					case LUpdate:
-						// reuse Key string in db and Key in rlog will be GCed.
-						r, ok := s.db[rlog.Key]
-						if !ok {
-							// record in db may be sometimes deleted. complete with rlog.Key for idempotency.
-							r.Key = rlog.Key
-						}
-						r.Value = rlog.Value
-						s.db[r.Key] = r
-
-					case LDelete:
-						delete(s.db, rlog.Key)
-					}
-				}
 				// clear logs
 				logs = nil
 
@@ -514,11 +520,12 @@ func (s *Storage) LoadCheckPoint() error {
 }
 
 func (txn *Txn) Read(key string) ([]byte, error) {
-	if r, ok := txn.writeSet[key]; ok {
-		if r.deleted {
+	if idx, ok := txn.writeSet[key]; ok {
+		rec := txn.logs[idx]
+		if rec.Action == LDelete {
 			return nil, ErrNotExist
 		}
-		return r.Value, nil
+		return rec.Value, nil
 	} else {
 		txn.s.lock.RLock(key)
 		defer txn.s.lock.RUnlock(key)
@@ -540,12 +547,13 @@ func clone(v []byte) []byte {
 
 func (txn *Txn) Insert(key string, value []byte) error {
 	// check writeSet
-	if r, ok := txn.writeSet[key]; ok {
-		if !r.deleted {
+	if idx, ok := txn.writeSet[key]; ok {
+		rec := txn.logs[idx]
+		if rec.Action != LDelete {
 			return ErrExist
 		}
 		// reuse key in writeSet
-		key = r.Key
+		key = rec.Key
 	} else {
 		// lock record
 		txn.s.lock.Lock(key)
@@ -562,14 +570,6 @@ func (txn *Txn) Insert(key string, value []byte) error {
 	// clone value to prevent injection after transaction
 	value = clone(value)
 
-	// add to or update writeSet
-	txn.writeSet[key] = RecordCache{
-		Record: Record{
-			Key:   key,
-			Value: value,
-		},
-	}
-
 	// add insert log
 	txn.logs = append(txn.logs, RecordLog{
 		Action: LInsert,
@@ -578,17 +578,21 @@ func (txn *Txn) Insert(key string, value []byte) error {
 			Value: value,
 		},
 	})
+
+	// add to or update writeSet (index of logs)
+	txn.writeSet[key] = len(txn.logs) - 1
 	return nil
 }
 
 func (txn *Txn) Update(key string, value []byte) error {
 	// check writeSet
-	if r, ok := txn.writeSet[key]; ok {
-		if r.deleted {
+	if idx, ok := txn.writeSet[key]; ok {
+		rec := txn.logs[idx]
+		if rec.Action == LDelete {
 			return ErrNotExist
 		}
 		// reuse key in writeSet
-		key = r.Key
+		key = rec.Key
 	} else {
 		// lock record
 		txn.s.lock.Lock(key)
@@ -606,13 +610,6 @@ func (txn *Txn) Update(key string, value []byte) error {
 	// clone value to prevent injection after transaction
 	value = clone(value)
 
-	txn.writeSet[key] = RecordCache{
-		Record: Record{
-			Key:   key,
-			Value: value,
-		},
-	}
-
 	// add update log
 	txn.logs = append(txn.logs, RecordLog{
 		Action: LUpdate,
@@ -621,17 +618,21 @@ func (txn *Txn) Update(key string, value []byte) error {
 			Value: value,
 		},
 	})
+
+	// add to or update writeSet (index of logs)
+	txn.writeSet[key] = len(txn.logs) - 1
 	return nil
 }
 
 func (txn *Txn) Delete(key string) error {
 	// check writeSet
-	if r, ok := txn.writeSet[key]; ok {
-		if r.deleted {
+	if idx, ok := txn.writeSet[key]; ok {
+		rec := txn.logs[idx]
+		if rec.Action == LDelete {
 			return ErrNotExist
 		}
 		// reuse key in writeSet
-		key = r.Key
+		key = rec.Key
 	} else {
 		// lock record
 		txn.s.lock.Lock(key)
@@ -646,13 +647,6 @@ func (txn *Txn) Delete(key string) error {
 		key = r.Key
 	}
 
-	txn.writeSet[key] = RecordCache{
-		deleted: true,
-		Record: Record{
-			Key: key,
-		},
-	}
-
 	// add delete log
 	txn.logs = append(txn.logs, RecordLog{
 		Action: LDelete,
@@ -661,32 +655,28 @@ func (txn *Txn) Delete(key string) error {
 		},
 	})
 
+	// add to or update writeSet (index of logs)
+	txn.writeSet[key] = len(txn.logs) - 1
+
 	return nil
 }
 
 func (txn *Txn) Commit() error {
-	//if len(txn.writeSet) == 0 {
-	//	// no need to write WAL
-	//	return nil
-	//}
-	err := txn.s.SaveLogs(txn.logs)
+	err := txn.s.SaveWAL(txn.logs)
 	if err != nil {
 		return err
 	}
 
 	// write back writeSet to db (in memory)
-	for _, r := range txn.writeSet {
-		if r.deleted {
-			delete(txn.s.db, r.Key)
-		} else {
-			txn.s.db[r.Key] = r.Record
-		}
+	txn.s.ApplyLogs(txn.logs)
 
+	// cleanup writeSet
+	for key := range txn.writeSet {
 		// unlock record
-		txn.s.lock.Unlock(r.Key)
+		txn.s.lock.Unlock(key)
 
 		// remove from writeSet
-		delete(txn.writeSet, r.Key)
+		delete(txn.writeSet, key)
 	}
 
 	// clear logs
@@ -697,11 +687,11 @@ func (txn *Txn) Commit() error {
 }
 
 func (txn *Txn) Abort() {
-	for k := range txn.writeSet {
+	for key := range txn.writeSet {
 		// unlock record
-		txn.s.lock.Unlock(k)
+		txn.s.lock.Unlock(key)
 
-		delete(txn.writeSet, k)
+		delete(txn.writeSet, key)
 	}
 	txn.logs = nil
 }
