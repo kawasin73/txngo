@@ -313,63 +313,62 @@ func (s *Storage) LoadWAL() (int, error) {
 	var (
 		logs  []RecordLog
 		buf   [4096]byte
+		head  int
 		size  int
 		nlogs int
 	)
 
 	// redo all record logs in WAL file
 	for {
-		n, err := s.wal.Read(buf[size:])
-		size += n
-		if err == io.EOF {
-			break
-		} else if err != nil {
-			return 0, err
-		}
+		var rlog RecordLog
+		n, err := rlog.Deserialize(buf[head:size])
+		if err == ErrBufferShort {
+			// move data to head
+			copy(buf[:], buf[head:size])
+			size -= head
 
-		head := 0
-		for {
-			var rlog RecordLog
-			n, err = rlog.Deserialize(buf[head:size])
-			if err == ErrBufferShort {
-				// move data to head
-				copy(buf[:], buf[head:size])
-				size -= head
+			if size == 4096 {
+				// buffer size (4096) is too short for this log
+				// TODO: allocate and read directly to db buffer
+				return 0, err
+			}
 
-				if size == 4096 {
-					// buffer size (4096) is too short for this log
-					// TODO: allocate and read directly to db buffer
-					return 0, err
-				}
-				// read more log data to buffer
+			// read more log data to buffer
+			n, err = s.wal.Read(buf[size:])
+			size += n
+			if err == io.EOF {
 				break
 			} else if err != nil {
 				return 0, err
 			}
-			head += n
-			nlogs++
+			continue
+		} else if err != nil {
+			return 0, err
+		}
+		head += n
+		nlogs++
 
-			switch rlog.Action {
-			case LInsert, LUpdate, LDelete:
-				// append log
-				logs = append(logs, rlog)
+		switch rlog.Action {
+		case LInsert, LUpdate, LDelete:
+			// append log
+			logs = append(logs, rlog)
 
-			case LCommit:
-				// redo record logs
-				s.ApplyLogs(logs)
+		case LCommit:
+			// redo record logs
+			s.ApplyLogs(logs)
 
-				// clear logs
-				logs = nil
+			// clear logs
+			logs = nil
 
-			case LAbort:
-				// clear logs
-				logs = nil
+		case LAbort:
+			// clear logs
+			logs = nil
 
-			default:
-				// skip
-			}
+		default:
+			// skip
 		}
 	}
+
 	return nlogs, nil
 }
 
@@ -492,6 +491,7 @@ func (s *Storage) LoadCheckPoint() error {
 			} else if err != nil {
 				return err
 			}
+			continue
 		} else if err != nil {
 			return err
 		}
