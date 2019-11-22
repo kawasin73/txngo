@@ -42,8 +42,7 @@ type Record struct {
 func (r *Record) Serialize(buf []byte) (int, error) {
 	key := []byte(r.Key)
 	value := r.Value
-	recordLen := 5 + len(key) + len(value)
-	total := recordLen + 4
+	total := 5 + len(key) + len(value)
 
 	// check buffer size
 	if len(buf) < total {
@@ -57,13 +56,6 @@ func (r *Record) Serialize(buf []byte) (int, error) {
 	copy(buf[5:], key)
 	copy(buf[5+len(key):], r.Value)
 
-	// generate checksum
-	hash := crc32.NewIEEE()
-	if _, err := hash.Write(buf[:recordLen]); err != nil {
-		return 0, err
-	}
-	binary.BigEndian.PutUint32(buf[recordLen:], hash.Sum32())
-
 	return total, nil
 }
 
@@ -75,26 +67,16 @@ func (r *Record) Deserialize(buf []byte) (int, error) {
 	// parse length
 	keyLen := buf[0]
 	valueLen := binary.BigEndian.Uint32(buf[1:])
-	recordLen := 5 + int(keyLen) + int(valueLen)
-	total := recordLen + 4
+	total := 5 + int(keyLen) + int(valueLen)
 	if len(buf) < total {
 		return 0, ErrBufferShort
-	}
-
-	// validate checksum
-	hash := crc32.NewIEEE()
-	if _, err := hash.Write(buf[:recordLen]); err != nil {
-		return 0, err
-	}
-	if binary.BigEndian.Uint32(buf[recordLen:]) != hash.Sum32() {
-		return 0, ErrChecksum
 	}
 
 	// copy key and value from buffer
 	r.Key = string(buf[5 : 5+keyLen])
 	// TODO: support NULL value
 	r.Value = make([]byte, valueLen)
-	copy(r.Value, buf[5+keyLen:recordLen])
+	copy(r.Value, buf[5+keyLen:total])
 
 	return total, nil
 }
@@ -105,46 +87,66 @@ type RecordLog struct {
 }
 
 func (r *RecordLog) Serialize(buf []byte) (int, error) {
-	if len(buf) < 1 {
+	if len(buf) < 5 {
 		return 0, ErrBufferShort
-	}
-
-	if r.Action > LRead {
-		// LCommit or LAbort
-		buf[0] = r.Action
-		return 1, nil
-	}
-
-	// serialize record content first (check buffer size)
-	n, err := r.Record.Serialize(buf[1:])
-	if err != nil {
-		return 0, err
 	}
 
 	buf[0] = r.Action
-	return 1 + n, nil
+	var total = 1
+	if r.Action > LRead {
+		// LCommit or LAbort
+	} else {
+		// serialize record content first (check buffer size)
+		n, err := r.Record.Serialize(buf[1:])
+		if err != nil {
+			return 0, err
+		}
+		total += n
+	}
+	if len(buf) < total+4 {
+		return 0, ErrBufferShort
+	}
+
+	// generate checksum
+	hash := crc32.NewIEEE()
+	if _, err := hash.Write(buf[:total]); err != nil {
+		return 0, err
+	}
+	binary.BigEndian.PutUint32(buf[total:], hash.Sum32())
+
+	return total + 4, nil
 }
 
 func (r *RecordLog) Deserialize(buf []byte) (int, error) {
-	if len(buf) < 1 {
+	if len(buf) < 5 {
 		return 0, ErrBufferShort
 	}
 	r.Action = buf[0]
-
+	var total = 1
 	switch r.Action {
 	case LCommit:
-		return 1, nil
 
 	case LInsert, LUpdate, LDelete:
 		n, err := r.Record.Deserialize(buf[1:])
 		if err != nil {
 			return 0, err
 		}
-		return 1 + n, nil
+		total += n
 
 	default:
 		return 0, fmt.Errorf("action is not supported : %v", r.Action)
 	}
+
+	// validate checksum
+	hash := crc32.NewIEEE()
+	if _, err := hash.Write(buf[:total]); err != nil {
+		return 0, err
+	}
+	if binary.BigEndian.Uint32(buf[total:]) != hash.Sum32() {
+		return 0, ErrChecksum
+	}
+
+	return total + 4, nil
 }
 
 type RecordCache struct {
