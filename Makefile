@@ -5,10 +5,15 @@ txngo:
 
 .PHONY: run
 run:
-	GOMAXPROCS=1 go run $(SRCS)
+	go run $(SRCS)
 
+.PHONY: run_tcp
+run_tcp:
+	go run $(SRCS) -tcp localhost:3000
+
+.PHONY: test
 test:
-	GOMAXPROCS=1 go test -v
+	go test -v
 
 .PHONY: clean
 clean:

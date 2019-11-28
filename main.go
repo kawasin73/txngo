@@ -12,7 +12,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -158,6 +157,7 @@ type lock struct {
 }
 
 type Locker struct {
+	mu      sync.Mutex
 	mutexes map[string]*lock
 }
 
@@ -168,6 +168,7 @@ func NewLocker() *Locker {
 }
 
 func (l *Locker) refLock(key string) *lock {
+	l.mu.Lock()
 	rec, ok := l.mutexes[key]
 	if !ok {
 		// TODO: not create lock object each time, use Pool or preallocate for each record
@@ -175,15 +176,18 @@ func (l *Locker) refLock(key string) *lock {
 		l.mutexes[key] = rec
 	}
 	rec.refs++
+	l.mu.Unlock()
 	return rec
 }
 
 func (l *Locker) unrefLock(key string) *lock {
+	l.mu.Lock()
 	rec := l.mutexes[key]
 	rec.refs--
 	if rec.refs == 0 {
 		delete(l.mutexes, key)
 	}
+	l.mu.Unlock()
 	return rec
 }
 
@@ -847,9 +851,6 @@ func main() {
 	tcpaddr := flag.String("tcp", "", "tcp handler address (e.g. localhost:3000)")
 
 	flag.Parse()
-
-	// execute on single thread
-	runtime.GOMAXPROCS(1)
 
 	wal, err := os.OpenFile(*walPath, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0600)
 	if err != nil {
