@@ -563,23 +563,25 @@ func clone(v []byte) []byte {
 	return v2
 }
 
-func (txn *Txn) Insert(key string, value []byte) error {
+// ensureNotExist check readSet and writeSet step by step that there IS NOT the record.
+// This method is used by Insert.
+func (txn *Txn) ensureNotExist(key string) (string, error) {
 	if r, ok := txn.readSet[key]; ok {
 		if r != nil {
-			return ErrExist
+			return "", ErrExist
 		}
 		// reallocate string
 		key = string(key)
 
 		if !txn.s.lock.Upgrade(key) {
-			return ErrDeadLock
+			return "", ErrDeadLock
 		}
 		// move record from readSet to writeSet
 		delete(txn.readSet, key)
 	} else if idx, ok := txn.writeSet[key]; ok {
 		rec := txn.logs[idx]
 		if rec.Action != LDelete {
-			return ErrExist
+			return "", ErrExist
 		}
 		// reuse key in writeSet
 		key = rec.Key
@@ -590,10 +592,58 @@ func (txn *Txn) Insert(key string, value []byte) error {
 		// check that the key not exists in db
 		if _, ok := txn.s.db[key]; ok {
 			txn.s.lock.Unlock(key)
-			return ErrExist
+			return "", ErrExist
 		}
 		// reallocate string
 		key = string(key)
+	}
+
+	return key, nil
+}
+
+// ensureExist check readSet and writeSet step by step that there IS the record.
+// This method is used by Update, Delete.
+func (txn *Txn) ensureExist(key string) (newKey string, err error) {
+	if r, ok := txn.readSet[key]; ok {
+		if r == nil {
+			return "", ErrNotExist
+		}
+
+		// reuse key in readSet
+		key = r.Key
+		if !txn.s.lock.Upgrade(key) {
+			return "", ErrDeadLock
+		}
+		// move record from readSet to writeSet
+		delete(txn.readSet, key)
+	} else if idx, ok := txn.writeSet[key]; ok {
+		rec := txn.logs[idx]
+		if rec.Action == LDelete {
+			return "", ErrNotExist
+		}
+		// reuse key in writeSet
+		key = rec.Key
+	} else {
+		// lock record
+		txn.s.lock.Lock(key)
+
+		// check that the key exists in db
+		r, ok := txn.s.db[key]
+		if !ok {
+			txn.s.lock.Unlock(key)
+			return "", ErrNotExist
+		}
+		// reuse key in db
+		key = r.Key
+	}
+
+	return key, nil
+}
+
+func (txn *Txn) Insert(key string, value []byte) error {
+	key, err := txn.ensureNotExist(key)
+	if err != nil {
+		return err
 	}
 
 	// clone value to prevent injection after transaction
@@ -614,36 +664,9 @@ func (txn *Txn) Insert(key string, value []byte) error {
 }
 
 func (txn *Txn) Update(key string, value []byte) error {
-	if r, ok := txn.readSet[key]; ok {
-		if r == nil {
-			return ErrNotExist
-		}
-
-		key = r.Key
-		if !txn.s.lock.Upgrade(key) {
-			return ErrDeadLock
-		}
-		// move record from readSet to writeSet
-		delete(txn.readSet, key)
-	} else if idx, ok := txn.writeSet[key]; ok {
-		rec := txn.logs[idx]
-		if rec.Action == LDelete {
-			return ErrNotExist
-		}
-		// reuse key in writeSet
-		key = rec.Key
-	} else {
-		// lock record
-		txn.s.lock.Lock(key)
-
-		// check that the key exists in db
-		r, ok := txn.s.db[key]
-		if !ok {
-			txn.s.lock.Unlock(key)
-			return ErrNotExist
-		}
-		// reuse key in db
-		key = r.Key
+	key, err := txn.ensureExist(key)
+	if err != nil {
+		return err
 	}
 
 	// clone value to prevent injection after transaction
@@ -664,36 +687,9 @@ func (txn *Txn) Update(key string, value []byte) error {
 }
 
 func (txn *Txn) Delete(key string) error {
-	if r, ok := txn.readSet[key]; ok {
-		if r == nil {
-			return ErrNotExist
-		}
-
-		key = r.Key
-		if !txn.s.lock.Upgrade(key) {
-			return ErrDeadLock
-		}
-		// move record from readSet to writeSet
-		delete(txn.readSet, key)
-	} else if idx, ok := txn.writeSet[key]; ok {
-		rec := txn.logs[idx]
-		if rec.Action == LDelete {
-			return ErrNotExist
-		}
-		// reuse key in writeSet
-		key = rec.Key
-	} else {
-		// lock record
-		txn.s.lock.Lock(key)
-
-		// check that the key exists in db
-		r, ok := txn.s.db[key]
-		if !ok {
-			txn.s.lock.Unlock(key)
-			return ErrNotExist
-		}
-		// reuse key in db
-		key = r.Key
+	key, err := txn.ensureExist(key)
+	if err != nil {
+		return err
 	}
 
 	// add delete log
