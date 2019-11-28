@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/kawasin73/umutex"
 )
 
 const (
@@ -32,6 +34,7 @@ var (
 	ErrNotExist    = errors.New("record not exists")
 	ErrBufferShort = errors.New("buffer size is not enough to deserialize")
 	ErrChecksum    = errors.New("checksum does not match")
+	ErrDeadLock    = errors.New("deadlock detected")
 )
 
 type Record struct {
@@ -150,7 +153,7 @@ func (r *RecordLog) Deserialize(buf []byte) (int, error) {
 }
 
 type lock struct {
-	mu   sync.RWMutex
+	mu   umutex.UMutex
 	refs int
 }
 
@@ -204,6 +207,11 @@ func (l *Locker) RUnlock(key string) {
 	rec.mu.RUnlock()
 }
 
+func (l *Locker) Upgrade(key string) bool {
+	rec := l.mutexes[key]
+	return rec.mu.Upgrade()
+}
+
 type Storage struct {
 	muWAL   sync.Mutex
 	dbPath  string
@@ -213,12 +221,6 @@ type Storage struct {
 	lock    *Locker
 }
 
-type Txn struct {
-	s        *Storage
-	logs     []RecordLog
-	writeSet map[string]int
-}
-
 func NewStorage(wal *os.File, dbPath, tmpPath string) *Storage {
 	return &Storage{
 		dbPath:  dbPath,
@@ -226,13 +228,6 @@ func NewStorage(wal *os.File, dbPath, tmpPath string) *Storage {
 		wal:     wal,
 		db:      make(map[string]Record),
 		lock:    NewLocker(),
-	}
-}
-
-func (s *Storage) NewTxn() *Txn {
-	return &Txn{
-		s:        s,
-		writeSet: make(map[string]int),
 	}
 }
 
@@ -515,22 +510,45 @@ func (s *Storage) LoadCheckPoint() error {
 	return nil
 }
 
+type Txn struct {
+	s        *Storage
+	logs     []RecordLog
+	readSet  map[string]*Record
+	writeSet map[string]int
+}
+
+func (s *Storage) NewTxn() *Txn {
+	return &Txn{
+		s:        s,
+		readSet:  make(map[string]*Record),
+		writeSet: make(map[string]int),
+	}
+}
+
 func (txn *Txn) Read(key string) ([]byte, error) {
-	if idx, ok := txn.writeSet[key]; ok {
+	if r, ok := txn.readSet[key]; ok {
+		if r == nil {
+			return nil, ErrNotExist
+		}
+		return r.Value, nil
+	} else if idx, ok := txn.writeSet[key]; ok {
 		rec := txn.logs[idx]
 		if rec.Action == LDelete {
 			return nil, ErrNotExist
 		}
 		return rec.Value, nil
-	} else {
-		txn.s.lock.RLock(key)
-		defer txn.s.lock.RUnlock(key)
 	}
+
+	// read lock
+	txn.s.lock.RLock(key)
 
 	r, ok := txn.s.db[key]
 	if !ok {
+		txn.readSet[key] = nil
 		return nil, ErrNotExist
 	}
+
+	txn.readSet[r.Key] = &r
 	return r.Value, nil
 }
 
@@ -542,8 +560,19 @@ func clone(v []byte) []byte {
 }
 
 func (txn *Txn) Insert(key string, value []byte) error {
-	// check writeSet
-	if idx, ok := txn.writeSet[key]; ok {
+	if r, ok := txn.readSet[key]; ok {
+		if r != nil {
+			return ErrExist
+		}
+		// reallocate string
+		key = string(key)
+
+		if !txn.s.lock.Upgrade(key) {
+			return ErrDeadLock
+		}
+		// move record from readSet to writeSet
+		delete(txn.readSet, key)
+	} else if idx, ok := txn.writeSet[key]; ok {
 		rec := txn.logs[idx]
 		if rec.Action != LDelete {
 			return ErrExist
@@ -581,8 +610,18 @@ func (txn *Txn) Insert(key string, value []byte) error {
 }
 
 func (txn *Txn) Update(key string, value []byte) error {
-	// check writeSet
-	if idx, ok := txn.writeSet[key]; ok {
+	if r, ok := txn.readSet[key]; ok {
+		if r == nil {
+			return ErrNotExist
+		}
+
+		key = r.Key
+		if !txn.s.lock.Upgrade(key) {
+			return ErrDeadLock
+		}
+		// move record from readSet to writeSet
+		delete(txn.readSet, key)
+	} else if idx, ok := txn.writeSet[key]; ok {
 		rec := txn.logs[idx]
 		if rec.Action == LDelete {
 			return ErrNotExist
@@ -621,8 +660,18 @@ func (txn *Txn) Update(key string, value []byte) error {
 }
 
 func (txn *Txn) Delete(key string) error {
-	// check writeSet
-	if idx, ok := txn.writeSet[key]; ok {
+	if r, ok := txn.readSet[key]; ok {
+		if r == nil {
+			return ErrNotExist
+		}
+
+		key = r.Key
+		if !txn.s.lock.Upgrade(key) {
+			return ErrDeadLock
+		}
+		// move record from readSet to writeSet
+		delete(txn.readSet, key)
+	} else if idx, ok := txn.writeSet[key]; ok {
 		rec := txn.logs[idx]
 		if rec.Action == LDelete {
 			return ErrNotExist
@@ -658,6 +707,12 @@ func (txn *Txn) Delete(key string) error {
 }
 
 func (txn *Txn) Commit() error {
+	// clearnup readSet before save WAL (S2PL)
+	for key := range txn.readSet {
+		txn.s.lock.RUnlock(key)
+		delete(txn.readSet, key)
+	}
+
 	err := txn.s.SaveWAL(txn.logs)
 	if err != nil {
 		return err
@@ -668,10 +723,7 @@ func (txn *Txn) Commit() error {
 
 	// cleanup writeSet
 	for key := range txn.writeSet {
-		// unlock record
 		txn.s.lock.Unlock(key)
-
-		// remove from writeSet
 		delete(txn.writeSet, key)
 	}
 
@@ -683,10 +735,12 @@ func (txn *Txn) Commit() error {
 }
 
 func (txn *Txn) Abort() {
+	for key := range txn.readSet {
+		txn.s.lock.RUnlock(key)
+		delete(txn.readSet, key)
+	}
 	for key := range txn.writeSet {
-		// unlock record
 		txn.s.lock.Unlock(key)
-
 		delete(txn.writeSet, key)
 	}
 	txn.logs = nil
