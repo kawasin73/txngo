@@ -4,9 +4,13 @@
 
 simple transaction implementation with Go.
 
-txngo is now based on **S2PL (Strict Two Phase Lock) Concurrency Control** with Single Thread and is **In-memory KVS**.
+txngo is now based on **S2PL (Strict Two Phase Lock) Concurrency Control** with **MultiThread** and is **In-memory KVS**.
 
-Key is string (< 255 length) and Value is []byte (< unsigned 32bit interger max size). 
+Key is string (< 255 length) and Value is []byte (< unsigned 32bit interger max size).
+
+Using Upgradable RWMutex by [github.com/kawasin73/umutex](https://github.com/kawasin73/umutex) internally.
+
+txngo have interactive interface via stdio or tcp.  
 
 ## Features
 
