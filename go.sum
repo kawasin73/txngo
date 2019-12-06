@@ -1,2 +1,4 @@
 github.com/kawasin73/umutex v0.1.0 h1:2tqjaiY8NVRMWQSQOJbDAc96tSXsZwdlVySMr/+2C10=
 github.com/kawasin73/umutex v0.1.0/go.mod h1:A02N2muKVFMvFlp5c+hBycgdH964YtieGs+7mYB16NU=
+github.com/kawasin73/umutex v0.2.1 h1:Onkzz3LKs1HThskVwdhhBocqdRQqwCZ03quDJzuPzPo=
+github.com/kawasin73/umutex v0.2.1/go.mod h1:A02N2muKVFMvFlp5c+hBycgdH964YtieGs+7mYB16NU=

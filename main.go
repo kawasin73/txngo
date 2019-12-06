@@ -223,6 +223,11 @@ func (l *Locker) Upgrade(key string) bool {
 	return rec.mu.Upgrade()
 }
 
+func (l *Locker) Downgrade(key string) {
+	rec := l.getLock(key)
+	rec.mu.Downgrade()
+}
+
 type Storage struct {
 	muWAL   sync.Mutex
 	muDB    sync.RWMutex
@@ -601,16 +606,18 @@ func (txn *Txn) ensureNotExist(key string) (string, error) {
 		// lock record
 		txn.s.lock.Lock(key)
 
-		// check that the key not exists in db
-		txn.s.muDB.RLock()
-		_, ok := txn.s.db[key]
-		txn.s.muDB.RUnlock()
-		if ok {
-			txn.s.lock.Unlock(key)
-			return "", ErrExist
-		}
 		// reallocate string
 		key = string(key)
+
+		// check that the key not exists in db
+		txn.s.muDB.RLock()
+		r, ok := txn.s.db[key]
+		txn.s.muDB.RUnlock()
+		if ok {
+			txn.readSet[key] = &r
+			txn.s.lock.Downgrade(key)
+			return "", ErrExist
+		}
 	}
 
 	return key, nil
@@ -647,7 +654,9 @@ func (txn *Txn) ensureExist(key string) (newKey string, err error) {
 		r, ok := txn.s.db[key]
 		txn.s.muDB.RUnlock()
 		if !ok {
-			txn.s.lock.Unlock(key)
+			key = string(key)
+			txn.readSet[key] = nil
+			txn.s.lock.Downgrade(key)
 			return "", ErrNotExist
 		}
 		// reuse key in db
