@@ -191,6 +191,13 @@ func (l *Locker) unrefLock(key string) *lock {
 	return rec
 }
 
+func (l *Locker) getLock(key string) *lock {
+	l.mu.Lock()
+	rec := l.mutexes[key]
+	l.mu.Unlock()
+	return rec
+}
+
 func (l *Locker) Lock(key string) {
 	rec := l.refLock(key)
 	rec.mu.Lock()
@@ -212,7 +219,7 @@ func (l *Locker) RUnlock(key string) {
 }
 
 func (l *Locker) Upgrade(key string) bool {
-	rec := l.mutexes[key]
+	rec := l.getLock(key)
 	return rec.mu.Upgrade()
 }
 
