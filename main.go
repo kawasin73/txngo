@@ -218,6 +218,7 @@ func (l *Locker) Upgrade(key string) bool {
 
 type Storage struct {
 	muWAL   sync.Mutex
+	muDB    sync.RWMutex
 	dbPath  string
 	tmpPath string
 	wal     *os.File
@@ -236,6 +237,8 @@ func NewStorage(wal *os.File, dbPath, tmpPath string) *Storage {
 }
 
 func (s *Storage) ApplyLogs(logs []RecordLog) {
+	s.muDB.Lock()
+	defer s.muDB.Unlock()
 	// TODO: optimize when duplicate keys in logs
 	for _, rlog := range logs {
 		switch rlog.Action {
@@ -546,7 +549,9 @@ func (txn *Txn) Read(key string) ([]byte, error) {
 	// read lock
 	txn.s.lock.RLock(key)
 
+	txn.s.muDB.RLock()
 	r, ok := txn.s.db[key]
+	txn.s.muDB.RUnlock()
 	if !ok {
 		txn.readSet[key] = nil
 		return nil, ErrNotExist
@@ -590,7 +595,10 @@ func (txn *Txn) ensureNotExist(key string) (string, error) {
 		txn.s.lock.Lock(key)
 
 		// check that the key not exists in db
-		if _, ok := txn.s.db[key]; ok {
+		txn.s.muDB.RLock()
+		_, ok := txn.s.db[key]
+		txn.s.muDB.RUnlock()
+		if ok {
 			txn.s.lock.Unlock(key)
 			return "", ErrExist
 		}
@@ -628,7 +636,9 @@ func (txn *Txn) ensureExist(key string) (newKey string, err error) {
 		txn.s.lock.Lock(key)
 
 		// check that the key exists in db
+		txn.s.muDB.RLock()
 		r, ok := txn.s.db[key]
+		txn.s.muDB.RUnlock()
 		if !ok {
 			txn.s.lock.Unlock(key)
 			return "", ErrNotExist
